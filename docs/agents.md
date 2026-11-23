@@ -61,10 +61,11 @@ Koostaja: AI (OpenAI Codex), kasutaja juhiste järgi. Käesoleva dokumendi esime
 
 ### Testimine ja andmete muutmine
 
-- Testid tuleb eelnevalt kokku leppida ja kirjeldada eraldi failis docs/testid.md. Enne ei tohi teste kasutada. 
-- Teste ei käivitata automaatselt pärast iga muudatust. Valitakse ainult
-  muudatuse sisuga seotud kontrollid ning nende käivitamiseks küsitakse
-  kasutajalt eraldi luba.
+- Teste käivitatakse ainult siis, kui kasutaja või ülesande väline
+  vastuvõtukriteerium seda sõnaselgelt nõuab. Teste ei käivitata automaatselt
+  ega tavapärase muudatuse osana.
+- Nõutud testid tuleb eelnevalt kirjeldada failis `docs/testid.md` ja piirata
+  konkreetse muudatuse kontrollimiseks vajaliku ulatusega.
 - Ilma kasutaja eraldi loata ei tohi käivitada teste ega kontrollskripte, mis
   kirjutavad andmebaasi või muudavad olemasolevaid andmeid.
 - Ilma sellise loata on lubatud ainult dry-run'id, lugemispäringud ja muud

@@ -1,0 +1,3 @@
+window.LIIKLUS_CONFIG = Object.freeze({
+  defaultConfidence: "${MODEL_CONFIDENCE_THRESHOLD}",
+});

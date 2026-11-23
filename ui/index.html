@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="et">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light" />
+    <link rel="stylesheet" href="./assets/app.css" />
+    <title></title>
+  </head>
+  <body>
+    <main class="wrap">
+      <header class="site-header">
+        <h1 data-i18n="app.title"></h1>
+        <p class="lead" data-i18n="app.lead"></p>
+      </header>
+
+      <section class="card" aria-labelledby="upload-title">
+        <div class="section-heading">
+          <div>
+            <p class="section-kicker" data-i18n="upload.kicker"></p>
+            <h2 id="upload-title" data-i18n="upload.title"></h2>
+          </div>
+          <span id="selectionStatus" class="status-badge" data-i18n="upload.empty_status"></span>
+        </div>
+
+        <form id="detectForm" novalidate>
+          <input id="imageInput" class="visually-hidden" name="file" type="file" accept="image/jpeg,image/png" />
+          <div id="dropZone" class="drop-zone" role="button" tabindex="0" aria-describedby="upload-help">
+            <div class="drop-zone-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" focusable="false">
+                <path d="M12 16V4m0 0L7.5 8.5M12 4l4.5 4.5M5 14v4a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-4" />
+              </svg>
+            </div>
+            <p class="drop-zone-title" data-i18n="upload.drop_title"></p>
+            <p id="upload-help" class="muted" data-i18n="upload.drop_help"></p>
+            <button id="chooseButton" type="button" data-i18n="upload.choose"></button>
+          </div>
+
+          <div id="selectionPanel" class="selection-panel hidden">
+            <div class="preview-frame preview-frame-small">
+              <img id="sourcePreview" alt="" />
+            </div>
+            <div class="selection-details">
+              <div>
+                <p id="selectedFilename" class="filename"></p>
+                <p id="selectedFileMeta" class="muted file-meta"></p>
+              </div>
+              <button id="replaceButton" class="secondary-button" type="button" data-i18n="upload.replace"></button>
+            </div>
+          </div>
+
+          <div class="analysis-controls">
+            <div class="field-group">
+              <label for="confidenceInput" data-i18n="upload.confidence_label"></label>
+              <input id="confidenceInput" name="conf" type="number" min="0" max="1" step="0.01" inputmode="decimal" data-i18n-placeholder="upload.confidence_placeholder" />
+              <p class="field-help" data-i18n="upload.confidence_help"></p>
+            </div>
+            <button id="analyzeButton" type="submit" disabled data-i18n="upload.analyze"></button>
+          </div>
+        </form>
+
+        <div id="requestMessage" class="message" role="status" aria-live="polite"></div>
+      </section>
+
+      <section id="resultsCard" class="card hidden" aria-labelledby="results-title">
+        <div class="section-heading results-heading">
+          <div>
+            <p class="section-kicker" data-i18n="results.kicker"></p>
+            <h2 id="results-title" data-i18n="results.title"></h2>
+          </div>
+          <span id="resultStatus" class="status-badge is-success" data-i18n="results.ready"></span>
+        </div>
+
+        <div id="countGrid" class="count-grid" aria-label="" data-i18n-aria-label="results.counts_aria"></div>
+
+        <figure class="result-figure">
+          <div class="preview-frame result-image-frame">
+            <img id="annotatedImage" alt="" data-i18n-alt="results.image_alt" />
+          </div>
+          <figcaption id="resultCaption" class="muted"></figcaption>
+        </figure>
+
+        <dl class="metadata-grid">
+          <div><dt data-i18n="results.filename"></dt><dd id="resultFilename"></dd></div>
+          <div><dt data-i18n="results.image_size"></dt><dd id="resultImageSize"></dd></div>
+          <div><dt data-i18n="results.confidence"></dt><dd id="resultConfidence"></dd></div>
+          <div><dt data-i18n="results.processing_time"></dt><dd id="resultDuration"></dd></div>
+          <div class="wide"><dt data-i18n="results.received_at"></dt><dd id="resultReceivedAt"></dd></div>
+        </dl>
+
+        <details id="detectionsDetails" class="detections-details">
+          <summary id="detectionsSummary"></summary>
+          <div class="table-scroll">
+            <table>
+              <thead>
+                <tr>
+                  <th scope="col" data-i18n="detections.class"></th>
+                  <th scope="col" data-i18n="detections.confidence"></th>
+                  <th scope="col" data-i18n="detections.coordinates"></th>
+                </tr>
+              </thead>
+              <tbody id="detectionsBody"></tbody>
+            </table>
+          </div>
+        </details>
+
+        <div class="result-actions">
+          <button id="viewJsonButton" type="button" data-i18n="results.view_json"></button>
+          <button id="newImageButton" class="secondary-button" type="button" data-i18n="results.new_image"></button>
+        </div>
+      </section>
+
+      <footer class="site-footer" data-i18n="app.footer"></footer>
+    </main>
+
+    <dialog id="jsonDialog" class="json-dialog" aria-labelledby="json-title">
+      <div class="dialog-heading">
+        <div>
+          <p class="section-kicker" data-i18n="json.kicker"></p>
+          <h2 id="json-title" data-i18n="json.title"></h2>
+        </div>
+        <div class="dialog-actions">
+          <button id="downloadJsonButton" class="icon-button" type="button" data-i18n-aria-label="json.download" data-i18n-title="json.download">
+            <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+              <path d="M12 3v12m0 0 4.5-4.5M12 15l-4.5-4.5M5 19h14" />
+            </svg>
+          </button>
+          <button id="closeJsonButton" class="secondary-button" type="button" data-i18n="json.close"></button>
+        </div>
+      </div>
+      <p class="muted json-help" data-i18n="json.help"></p>
+      <pre id="jsonOutput" class="json-output"></pre>
+    </dialog>
+
+    <script src="./assets/config.js"></script>
+    <script src="./assets/app.js" defer></script>
+  </body>
+</html>

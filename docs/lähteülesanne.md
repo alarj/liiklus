@@ -14,7 +14,8 @@ Dokumendi koostas algselt inimene. OpenAI Codex täiendas dokumenti 23. novembri
 - [API otspunktid](#api-otspunktid)
 - [Docker-konteiner](#docker-konteiner)
 - [Swagger](#swagger-api-kasutamiseks)
-- [URL ja hilisem UI](#url-ja-hilisem-ui)
+- [UI](#ui)
+- [Autentimise kavand](#autentimise-kavand)
 - [Tarnitavad failid](#failistruktuur-ja-tarnitavad-failid)
 
 ## Eesmärk
@@ -24,6 +25,7 @@ Luua kerge FastAPI rakendus Ubuntu ARM64 serverile, mis võtab vastu kaamerapild
 - **Keel ja raamistik:** Python 3.11+, FastAPI, Uvicorn
 - **Mudeli jooksutamine:** `onnxruntime` (ainult CPU, ilma PyTorchi/Ultralyticsi sõltuvusteta)
 - **Pilditöötlus:** `opencv-python-headless`, `numpy`
+- **UI:** staatiline HTML, eraldi CSS ja vanilla JavaScript eraldi nginx-konteineris
 - **Mudeli fail:** `models/best.onnx`
 - **Klassid:** loetakse käivitamisel ONNX-metaandmetest; praeguse mudeli
   järjestus on `0: bus`, `1: car`, `2: tram`.
@@ -98,7 +100,7 @@ Luua kerge FastAPI rakendus Ubuntu ARM64 serverile, mis võtab vastu kaamerapild
 
 - Swagger UI asub `/api/docs` ja OpenAPI skeem `/api/openapi.json`.
 
-## URL ja hilisem UI
+## UI
 
 - Kavandatav avalik API asub aadressil `https://liiklus.fun-o.eu/api/...`.
 - `liiklus.fun-o.eu` DNS-kirje on olemas.
@@ -106,14 +108,43 @@ Luua kerge FastAPI rakendus Ubuntu ARM64 serverile, mis võtab vastu kaamerapild
   seadistust, selle süntaks on kontrollitud ning konfiguratsioon on aktiivne.
 - `fun-o.eu` Let's Encrypt sertifikaat sisaldab `liiklus.fun-o.eu` nime ja
   kehtib 21. veebruarini 2027. Renewal kasutab hosti Certboti webroot-meetodit.
-- Hilisem UI töötab eraldi `liiklus-ui` konteineris ja kasutab sama API-t.
-  Avalik nginx suunab `/` UI-le ja `/api/` API-le.
+- UI töötab eraldi `liiklus-ui` nginx-konteineris; UI-d ei ühendata API
+  rakenduse ega API Docker image'iga.
+- Avalik nginx suunab `/` UI-le ja `/api/` API-le.
+- UI võtab vastu ühe JPEG- või PNG-pildi korraga ja saadab selle otspunktile
+  `POST /api/detect/image`. Brauser ei korda tuvastus-, loendus-, pilditöötlus-
+  ega sisendi piirangute äriloogikat.
+- UI kuvab API tagastatud märgendatud pildi, loendused, metaandmed ja
+  tuvastused. API JSON-vastust saab vaadata eraldi modalis; kuvamiseks loodud
+  koopiast eemaldatakse lennult `annotated_image.base64`, sest pilt kuvatakse
+  eraldi tavavaates. Modali ikoonnupust saab sama JSON-i ilma Base64-väljata
+  `.json` failina alla laadida.
+- UI CSS asub eraldi failis ja kasutab TTÜ-loengu projekti olemasolevat
+  kujunduskeelt. Kasutajaliidese tekstid tulevad eestikeelsest tõlkefailist.
+- UI kuvab tuvastuslävendi seletuses API vaikeväärtuse. Väärtus antakse UI
+  konteinerile Compose'i kaudu samast `MODEL_CONFIDENCE_THRESHOLD`
+  keskkonnamuutujast ega ole brauseri äriloogikas eraldi määratud.
+
+## Autentimise kavand
+
+- Praeguses etapis ei kasutata API ega UI autentimist.
+- `GET /api/health` jääb avalikuks ka pärast teiste API otspunktide
+  autentimise lisamist.
+- UI-le lisatakse hiljem Google'i OIDC-autentimine. Kasutajanime ja parooliga
+  autentimist ei lisata.
+- Google'iga autenditud UI ja välised API kliendid kasutavad eraldi
+  autentimismehhanisme. UI ei hoia brauseris API Basic- ega Bearer-mandaati.
+- Tulevane serveripoolne `/ui-api/` vahendus kontrollib Google'i sessiooni ja
+  edastab päringu samadele olemasolevatele `/api/` otspunktidele.
+- Avaliku API Basic- või Bearer-autentimise valik tehakse hiljem. Bearer on
+  eelistatud suund, kuid käesolevas etapis seda ei rakendata.
 
 ## Failistruktuur ja tarnitavad failid
 - `app.py` – kogu rakenduse loogika
 - `requirements.txt` – minimaalsed teegid
 - `Dockerfile` – kerge `python:3.11-slim` ARM64 konteiner
-- `docker-compose.yml` – konteineri käitus, mudeli mount ja `funo_net` võrk
+- `ui/` – eraldi staatiline UI, CSS, tõlked ja nginx-konteiner
+- `docker-compose.yml` – API ja UI konteinerite käitus, mudeli mount ja `funo_net` võrk
 - `.env.example` – käituskeskkonna seadistuse näidis
 - `README.md` – käivitamise ja `curl` testimise juhend
 - `docs/testid.md` – enne käivitamist ülevaadatav minimaalne testiplaan

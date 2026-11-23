@@ -1,4 +1,4 @@
-# Tallinna liikluse tuvastuse API
+# Tallinna liikluse tuvastuse API ja UI
 
 ## 1. Dokumendi päritolu
 
@@ -11,17 +11,24 @@ tehniliste otsuste põhjal.
 - [4. Eeldused](#4-eeldused)
 - [5. Seadistus ja käivitamine](#5-seadistus-ja-käivitamine)
 - [6. API kasutamine](#6-api-kasutamine)
-- [7. Sisendi piirangud](#7-sisendi-piirangud)
-- [8. Piltide ja mudeli säilitamine](#8-piltide-ja-mudeli-säilitamine)
-- [9. Keskkonnamuutujad](#9-keskkonnamuutujad)
-- [10. Testid](#10-testid)
-- [11. Praegune kontrollimise seis](#11-praegune-kontrollimise-seis)
+- [7. UI kasutamine](#7-ui-kasutamine)
+- [8. Sisendi piirangud](#8-sisendi-piirangud)
+- [9. Piltide ja mudeli säilitamine](#9-piltide-ja-mudeli-säilitamine)
+- [10. Autentimise kavand](#10-autentimise-kavand)
+- [11. Keskkonnamuutujad](#11-keskkonnamuutujad)
+- [12. Testid](#12-testid)
+- [13. Praegune kontrollimise seis](#13-praegune-kontrollimise-seis)
 
 ## 3. Ülevaade
 
 FastAPI rakendus loendab JPEG- või PNG-pildilt ONNX-mudeliga busse, autosid
 ja tramme. API tagastab JSON-vastuse; visualiseeringu otspunkt lisab samasse
 vastusesse Base64-kujul tuvastuskastidega JPEG-pildi.
+
+Eraldi `liiklus-ui` konteiner serveerib staatilist HTML-, CSS- ja
+JavaScript-liidest. UI saadab ühe pildi korraga olemasolevale
+`POST /api/detect/image` otspunktile ning ei teosta tuvastus- ega
+loendusloogikat brauseris uuesti.
 
 Otspunktid:
 
@@ -56,9 +63,9 @@ Ehita ja käivita konteiner:
 docker compose up --build --detach
 ```
 
-Kohalik API aadress on `http://127.0.0.1:8010`. Avaliku nginxi proxy ja
-SSL-sertifikaat on aktiivsed; pärast `liiklus-api` konteineri käivitamist on API
-kättesaadav ka aadressil `https://liiklus.fun-o.eu/api/...`.
+Kohalik API aadress on `http://127.0.0.1:8010`. Avalik nginx suunab
+`https://liiklus.fun-o.eu/` UI konteinerile ja `/api/` API konteinerile.
+Mõlemad konteinerid kasutavad välist Docker-võrku `funo_net`.
 
 Konteineri peatamine:
 
@@ -101,7 +108,33 @@ sisaldab märgendatud JPEG-i. Sisendpilt saadetakse mõlemale otspunktile
 tavalise `multipart/form-data` failina, mitte Base64-kujul. Ühe päringu jooksul
 käivitatakse mudel üks kord.
 
-## 7. Sisendi piirangud
+## 7. UI kasutamine
+
+UI võimaldab valida või lohistada ühe JPEG- või PNG-pildi, vaadata algpildi
+eelvaadet ning saata pildi API-le. Usalduslävendi võib jätta tühjaks; sel juhul
+kasutab API oma vaikeväärtust. Samuti võib sisestada väärtuse vahemikus `0`
+kuni `1`.
+
+UI nimetab parameetrit tuvastuslävendiks ja kuvab selgituses API
+vaikeväärtuse. `liiklus-ui` konteiner saab väärtuse Compose'i kaudu samast
+`MODEL_CONFIDENCE_THRESHOLD` keskkonnamuutujast; brauser ei otsusta ise API
+vaikeväärtust.
+
+Tulemusvaade kasutab ainult API vastust ja kuvab:
+
+- märgendatud JPEG-pildi;
+- API tagastatud klasside loendused ja koguarvu;
+- pildi mõõdu, kasutatud lävendi, töötlusaja ja päringu aja;
+- üksikud tuvastused koos usaldusväärtuste ja koordinaatidega;
+- eraldi modalis vormindatud JSON-vastuse, millest eemaldatakse kuvamise ajaks
+  `annotated_image.base64`. Märgendatud pilt kuvatakse tavavaates. Modali
+  ikoonnupp laadib sama, ilma Base64-väljata JSON-i `.json` failina alla.
+
+UI tekstid asuvad failis `ui/assets/i18n/et.json`. Kujundus lähtub
+TTÜ-loengu projekti värvidest, tüpograafiast, kaartidest ja vormielementidest;
+UI CSS jääb eraldi faili `ui/assets/app.css`.
+
+## 8. Sisendi piirangud
 
 - Lubatud MIME-tüübid: `image/jpeg` ja `image/png`.
 - Maksimaalne failisuurus: 5 MiB ehk 5 242 880 baiti.
@@ -109,7 +142,7 @@ käivitatakse mudel üks kord.
 - `conf` on mudeli tuvastuse minimaalne usalduslävend. Selle lubatud vahemik
   on `0.0` kuni `1.0` ja vaikeväärtus `0.45`.
 
-## 8. Piltide ja mudeli säilitamine
+## 9. Piltide ja mudeli säilitamine
 
 Üleslaetud pilte ei kirjutata projekti, andmebaasi ega püsivasse volume'isse.
 Päringu ajal võib FastAPI kasutada operatsioonisüsteemi ajutist puhvrit, mis
@@ -118,7 +151,27 @@ suletakse päringu lõppedes. Märgendatud vastus kodeeritakse mälus.
 Mudelifail ühendatakse konteinerisse kirjutuskaitstud failina:
 `./models/best.onnx:/app/models/best.onnx:ro`.
 
-## 9. Keskkonnamuutujad
+## 10. Autentimise kavand
+
+Praeguses etapis ei ole API-l ega UI-l autentimist. `GET /api/health` jääb ka
+pärast autentimise lisamist avalikuks.
+
+Tulevikus lisatakse UI-le Google'i OIDC-autentimine; eraldi kasutajanime ja
+parooliga sisselogimist ei tehta. Brauser kasutab serveripoolset turvalist
+sessiooniküpsist. Google'i tokenit ega API mandaati ei salvestata UI
+JavaScripti ega `localStorage`'isse.
+
+UI ja väliste API klientide autentimine jäävad eraldi usalduspiirideks.
+Google'iga autenditud UI päringud saab suunata serveripoolse `/ui-api/`
+vahenduse kaudu samadele olemasolevatele `/api/` otspunktidele. Avaliku API
+Basic- või Bearer-autentimise otsus tehakse hiljem; eelistatud suund on
+Bearer, kuid seda ei rakendata käesolevas etapis.
+
+Kõik UI API-kõned on koondatud ühte JavaScripti funktsiooni ja API baastee
+ühte konstanti, et tulevane `/api` -> `/ui-api` üleminek ei mõjutaks muud UI
+loogikat.
+
+## 11. Keskkonnamuutujad
 
 | Muutuja | Vaikeväärtus | Tähendus |
 | --- | ---: | --- |
@@ -128,20 +181,26 @@ Mudelifail ühendatakse konteinerisse kirjutuskaitstud failina:
 | `MAX_UPLOAD_BYTES` | `5242880` | Pildifaili maksimaalne suurus baitides |
 | `MAX_IMAGE_PIXELS` | `10000000` | Pildi maksimaalne pikslite arv |
 
-## 10. Testid
+## 12. Testid
 
 Automatiseeritud testid asuvad failis `tests/test_app.py`. Testid ei kuulu
-tootmisimage'isse ega käivitu API ehitamisel või käivitamisel. Pärast kasutaja
-eraldi luba saab need käivitada käsuga:
+tootmisimage'isse ega käivitu API ehitamisel või käivitamisel. Neid
+käivitatakse ainult siis, kui kasutaja või väline vastuvõtukriteerium seda
+sõnaselgelt nõuab. Nõutud testide käsk on:
 
 ```bash
 docker compose --profile testing run --rm testing
 ```
 
-## 11. Praegune kontrollimise seis
+## 13. Praegune kontrollimise seis
 
-Tootmisimage on ARM64 serveris ehitatud ja `liiklus-api` konteiner töötab.
-Käivituslogi kinnitab Uvicorni ja ONNX-mudeli startup'i õnnestumist.
-Automatiseeritud teste ei ole veel käivitatud. Minimaalne testiplaan on failis
-[`docs/testid.md`](docs/testid.md); testide käivitamine vajab kasutaja eraldi
-luba.
+Tootmis-API ja eraldi `liiklus-ui` konteiner töötavad. Avalik nginx suunab
+`https://liiklus.fun-o.eu/` UI-le ning `/api/` API-le; avalik health vastab
+ootuspäraselt. UI image, konteineri nginx, ühine nginx ja avalikud põhifailid
+on kontrollitud.
+
+API 7 automatiseeritud testi läbisid ajutise `PYTHONPATH=/app` keskkonnaga.
+Dokumenteeritud testikäsul puudub testikonteineris püsiv `PYTHONPATH`, mistõttu
+see vajab enne parandamist eraldi otsust. Serveris polnud automatiseeritud
+visuaalkontrolliks Chromiumit ega Playwrighti. Täpsed tulemused ja piirangud on
+failis [`docs/testid.md`](docs/testid.md).
