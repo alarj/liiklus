@@ -54,6 +54,10 @@ Luua kerge FastAPI rakendus Ubuntu ARM64 serverile, mis võtab vastu kaamerapild
    - **Väljund (JSON):**
      ```json
      {
+       "request_received_at": "2026-11-23T19:42:07.123Z",
+       "processing_duration_ms": 612.4,
+       "filename": "kaamera.jpg",
+       "conf": 0.45,
        "image_size": {"width": 1150, "height": 550},
        "counts": {"bus": 0, "car": 0, "tram": 0},
        "total": 0,
@@ -64,7 +68,17 @@ Luua kerge FastAPI rakendus Ubuntu ARM64 serverile, mis võtab vastu kaamerapild
      ```
 2. **`POST /api/detect/image`**
    - **Sisend:** sama mis `/api/detect`.
-   - **Väljund:** JPEG-pilt (`image/jpeg`), kuhu on joonistatud tuvastatud kastid, klassinimed ja usaldusväärsus.
+   - **Väljund:** sama JSON mis `/api/detect`, millele lisandub
+     `annotated_image`. Selle `media_type` on `image/jpeg` ja `base64` sisaldab
+     tuvastuskastide, klassinimede ja usaldusväärtustega JPEG-pilti.
+   - Sisendpilt saadetakse tavalise `multipart/form-data` failina. Mudel
+     käivitatakse ühe päringu jooksul ainult üks kord.
+   - Mõlema tuvastusotspunkti `request_received_at` on UTC-s ISO 8601
+     ajatempel, `processing_duration_ms` on valideerimise, eeltöötluse,
+     inferentsi ja järeltöötluse kestus millisekundites ning `filename` on
+     kliendi saadetud failinime basename või selle puudumisel `null`. Väli
+     `conf` näitab päringus tegelikult kasutatud usalduslävendit, sealhulgas
+     `.env` vaikeväärtust, kui query-parameeter puudub.
 3. **`GET /api/health`**
    - Tagastab `{"status": "ok"}`.
 

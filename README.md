@@ -20,7 +20,8 @@ tehniliste otsuste põhjal.
 ## 3. Ülevaade
 
 FastAPI rakendus loendab JPEG- või PNG-pildilt ONNX-mudeliga busse, autosid
-ja tramme. API tagastab JSON-vastuse või tuvastuskastidega JPEG-pildi.
+ja tramme. API tagastab JSON-vastuse; visualiseeringu otspunkt lisab samasse
+vastusesse Base64-kujul tuvastuskastidega JPEG-pildi.
 
 Otspunktid:
 
@@ -82,15 +83,23 @@ curl -X POST \
   -F "file=@/tee/pildini.jpg;type=image/jpeg"
 ```
 
-Märgendatud JPEG:
+JSON koos märgendatud JPEG-iga:
 
 ```bash
 curl -X POST \
   "http://127.0.0.1:8010/api/detect/image?conf=0.45" \
-  -H "accept: image/jpeg" \
-  -F "file=@/tee/pildini.jpg;type=image/jpeg" \
-  --output detected.jpg
+  -H "accept: application/json" \
+  -F "file=@/tee/pildini.jpg;type=image/jpeg"
 ```
+
+Mõlemad tuvastusotspunktid tagastavad UTC-välja `request_received_at`,
+millisekundites `processing_duration_ms`, kliendi antud failinime `filename`,
+tegelikult kasutatud usalduslävendi `conf`, pildi mõõdud, klasside loendused ja
+tuvastused. `/api/detect/image` lisab
+objekti `annotated_image`, mille `media_type` on `image/jpeg` ja `base64`
+sisaldab märgendatud JPEG-i. Sisendpilt saadetakse mõlemale otspunktile
+tavalise `multipart/form-data` failina, mitte Base64-kujul. Ühe päringu jooksul
+käivitatakse mudel üks kord.
 
 ## 7. Sisendi piirangud
 

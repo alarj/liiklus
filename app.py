@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import ast
+import base64
 import hashlib
 import os
 import struct
 import threading
+import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated
 
@@ -14,7 +17,6 @@ import cv2
 import numpy as np
 import onnxruntime as ort
 from fastapi import FastAPI, File, HTTPException, Query, Request, Response, UploadFile
-from fastapi.responses import Response as FastAPIResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 
@@ -66,11 +68,27 @@ class Detection(BaseModel):
     bbox_xyxy: list[int]
 
 
-class DetectionResult(BaseModel):
+class DetectionData(BaseModel):
     image_size: ImageSize
     counts: dict[str, int]
     total: int
     detections: list[Detection]
+
+
+class DetectionResult(DetectionData):
+    request_received_at: datetime
+    processing_duration_ms: float
+    filename: str | None
+    conf: float
+
+
+class AnnotatedImage(BaseModel):
+    media_type: str
+    base64: str
+
+
+class DetectionImageResult(DetectionResult):
+    annotated_image: AnnotatedImage
 
 
 @dataclass(frozen=True)
@@ -109,7 +127,7 @@ class PreparedImage:
 @dataclass(frozen=True)
 class ProcessedImage:
     original: np.ndarray
-    result: DetectionResult
+    result: DetectionData
 
 
 def _positive_int_environment(name: str, default: int) -> int:
@@ -363,7 +381,7 @@ class Detector:
             counts[detection.class_name] += 1
         return ProcessedImage(
             original=prepared.original,
-            result=DetectionResult(
+            result=DetectionData(
                 image_size=ImageSize(width=width, height=height),
                 counts=counts,
                 total=len(detections),
@@ -484,6 +502,32 @@ def _annotate(image: np.ndarray, detections: list[Detection]) -> bytes:
     return jpeg.tobytes()
 
 
+def _safe_filename(filename: str | None) -> str | None:
+    if not filename:
+        return None
+    basename = filename.replace("\\", "/").rsplit("/", 1)[-1].strip()
+    return basename or None
+
+
+def _detection_result(
+    processed: ProcessedImage,
+    request_received_at: datetime,
+    processing_duration_ms: float,
+    filename: str | None,
+    confidence_threshold: float,
+) -> DetectionResult:
+    return DetectionResult(
+        request_received_at=request_received_at,
+        processing_duration_ms=round(processing_duration_ms, 3),
+        filename=_safe_filename(filename),
+        conf=confidence_threshold,
+        image_size=processed.result.image_size,
+        counts=processed.result.counts,
+        total=processed.result.total,
+        detections=processed.result.detections,
+    )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     app.state.detector = Detector(Settings.from_environment())
@@ -524,19 +568,28 @@ def detect(
         ),
     ] = DEFAULT_MODEL_CONFIDENCE,
 ) -> DetectionResult:
+    request_received_at = datetime.now(timezone.utc)
+    processing_started_at = time.perf_counter()
     detector = _detector(request)
     processed = detector.process(file, conf)
+    result = _detection_result(
+        processed,
+        request_received_at,
+        (time.perf_counter() - processing_started_at) * 1000,
+        file.filename,
+        conf,
+    )
     response.headers["X-Model-SHA256"] = detector.model_sha256
-    return processed.result
+    return result
 
 
 @app.post(
     "/api/detect/image",
-    response_class=FastAPIResponse,
-    responses={200: {"content": {"image/jpeg": {}}}},
+    response_model=DetectionImageResult,
 )
 def detect_image(
     request: Request,
+    response: Response,
     file: Annotated[UploadFile, File(description="JPEG or PNG image")],
     conf: Annotated[
         float,
@@ -546,11 +599,24 @@ def detect_image(
             description="Minimum model confidence required for a detection",
         ),
     ] = DEFAULT_MODEL_CONFIDENCE,
-) -> FastAPIResponse:
+) -> DetectionImageResult:
+    request_received_at = datetime.now(timezone.utc)
+    processing_started_at = time.perf_counter()
     detector = _detector(request)
     processed = detector.process(file, conf)
-    return FastAPIResponse(
-        content=_annotate(processed.original, processed.result.detections),
-        media_type="image/jpeg",
-        headers={"X-Model-SHA256": detector.model_sha256},
+    annotated_jpeg = _annotate(processed.original, processed.result.detections)
+    result = _detection_result(
+        processed,
+        request_received_at,
+        (time.perf_counter() - processing_started_at) * 1000,
+        file.filename,
+        conf,
+    )
+    response.headers["X-Model-SHA256"] = detector.model_sha256
+    return DetectionImageResult(
+        **result.model_dump(),
+        annotated_image=AnnotatedImage(
+            media_type="image/jpeg",
+            base64=base64.b64encode(annotated_jpeg).decode("ascii"),
+        ),
     )

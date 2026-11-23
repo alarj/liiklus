@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import base64
 import struct
+from datetime import datetime
 from io import BytesIO
 
 import cv2
@@ -124,23 +126,64 @@ def test_health(client: TestClient) -> None:
     assert response.json() == {"status": "ok"}
 
 
-def test_detection_endpoints_with_synthetic_image(client: TestClient) -> None:
+def test_detection_endpoints_with_synthetic_image(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     image = np.zeros((64, 64, 3), dtype=np.uint8)
     data = _encode(image, ".jpg")
     files = {"file": ("blank.jpg", data, "image/jpeg")}
+    process_calls = 0
+    original_process = client.app.state.detector.process
+
+    def counted_process(
+        file: UploadFile,
+        confidence_threshold: float,
+    ) -> traffic_app.ProcessedImage:
+        nonlocal process_calls
+        process_calls += 1
+        return original_process(file, confidence_threshold)
+
+    monkeypatch.setattr(client.app.state.detector, "process", counted_process)
 
     json_response = client.post("/api/detect", files=files)
 
     assert json_response.status_code == 200
+    assert process_calls == 1
     payload = json_response.json()
+    assert payload["filename"] == "blank.jpg"
+    assert payload["conf"] == traffic_app.DEFAULT_MODEL_CONFIDENCE
+    request_received_at = datetime.fromisoformat(
+        payload["request_received_at"].replace("Z", "+00:00")
+    )
+    assert request_received_at.utcoffset().total_seconds() == 0
+    assert payload["processing_duration_ms"] >= 0
     assert payload["image_size"] == {"width": 64, "height": 64}
     assert list(payload["counts"]) == ["bus", "car", "tram"]
     assert payload["total"] == sum(payload["counts"].values())
     assert len(json_response.headers["X-Model-SHA256"]) == 64
 
-    image_response = client.post("/api/detect/image", files=files)
+    image_response = client.post("/api/detect/image?conf=0.25", files=files)
 
     assert image_response.status_code == 200
-    assert image_response.headers["content-type"] == "image/jpeg"
+    assert process_calls == 2
+    assert image_response.headers["content-type"] == "application/json"
     assert len(image_response.headers["X-Model-SHA256"]) == 64
-    assert image_response.content.startswith(b"\xff\xd8")
+    image_payload = image_response.json()
+    assert image_payload["filename"] == "blank.jpg"
+    assert image_payload["conf"] == 0.25
+    image_request_received_at = datetime.fromisoformat(
+        image_payload["request_received_at"].replace("Z", "+00:00")
+    )
+    assert image_request_received_at.utcoffset().total_seconds() == 0
+    assert image_payload["processing_duration_ms"] >= 0
+    assert image_payload["image_size"] == payload["image_size"]
+    assert image_payload["counts"] == payload["counts"]
+    assert image_payload["total"] == payload["total"]
+    assert image_payload["detections"] == payload["detections"]
+    assert image_payload["annotated_image"]["media_type"] == "image/jpeg"
+    annotated_jpeg = base64.b64decode(
+        image_payload["annotated_image"]["base64"],
+        validate=True,
+    )
+    assert annotated_jpeg.startswith(b"\xff\xd8")
