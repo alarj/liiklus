@@ -6,8 +6,6 @@ This software is licensed under the **GNU Affero General Public License v3.0 (AG
 
 The detection model (`models/best.onnx`) is trained on the Ultralytics YOLOv8 architecture and is also subject to the AGPL-3.0 license.
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
 
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
 IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,

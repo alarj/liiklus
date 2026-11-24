@@ -1,5 +1,23 @@
 # Projekt: Tallinna liikluse tuvastuse API
 
+## Dokumendi päritolu
+
+Dokumendi koostas algselt inimene. OpenAI Codex täiendas dokumenti 23. novembril
+2026 kasutajaga kokku lepitud tehniliste otsuste põhjal.
+
+## Sisukord
+
+- [Eesmärk](#eesmärk)
+- [Tehniline virn](#tehniline-virn)
+- [Sisendpildi eeltöötlus](#sisendpildi-eeltöötlus-kriitiline-nõue)
+- [Sisendi piirangud ja säilitamine](#sisendi-piirangud-ja-säilitamine)
+- [API otspunktid](#api-otspunktid)
+- [Docker-konteiner](#docker-konteiner)
+- [Swagger](#swagger-api-kasutamiseks)
+- [UI](#ui)
+- [Autentimise kavand](#autentimise-kavand)
+- [Tarnitavad failid](#failistruktuur-ja-tarnitavad-failid)
+
 ## Eesmärk
 Luua kerge FastAPI rakendus Ubuntu ARM64 serverile, mis võtab vastu kaamerapildi ja tagastab ONNX-mudeli (`best.onnx`) põhjal tuvastatud sõidukite (auto, buss, tramm) arvud ning koordinaadid.
 
@@ -7,8 +25,10 @@ Luua kerge FastAPI rakendus Ubuntu ARM64 serverile, mis võtab vastu kaamerapild
 - **Keel ja raamistik:** Python 3.11+, FastAPI, Uvicorn
 - **Mudeli jooksutamine:** `onnxruntime` (ainult CPU, ilma PyTorchi/Ultralyticsi sõltuvusteta)
 - **Pilditöötlus:** `opencv-python-headless`, `numpy`
+- **UI:** staatiline HTML, eraldi CSS ja vanilla JavaScript eraldi nginx-konteineris
 - **Mudeli fail:** `models/best.onnx`
-- **Klassid (järjekorras):** `0: car`, `1: bus`, `2: tram`
+- **Klassid:** loetakse käivitamisel ONNX-metaandmetest; praeguse mudeli
+  järjestus on `0: bus`, `1: car`, `2: tram`.
 
 ## Sisendpildi eeltöötlus (kriitiline nõue)
 - Mudeli sisendmõõt on fikseeritud: **`1152 × 576`** (laius × kõrgus).
@@ -16,38 +36,115 @@ Luua kerge FastAPI rakendus Ubuntu ARM64 serverile, mis võtab vastu kaamerapild
 - Väiksemad pildid paigutatakse ülemisse vasakusse nurka `(0, 0)` ja täidetakse paremalt ning alt halli taustaga (`RGB 114, 114, 114`) kuni mõõduni `1152 × 576`.
 - Ainult juhul, kui sisendpilt on suurem kui `1152 × 576`, skaleeritakse see kuvasuhet hoides alla ja täidetakse ülejäänud servad halliga.
 
+## Sisendi piirangud ja säilitamine
+
+- Lubatud vormingud on JPEG (`image/jpeg`) ja PNG (`image/png`).
+- Pildifaili maksimaalne suurus on 5 MiB ehk 5 242 880 baiti.
+- Pildi laius korrutatud kõrgusega võib olla kuni 10 000 000 pikslit.
+- Mõõt kontrollitakse kodeeritud pildi päisest enne OpenCV-ga dekodeerimist.
+- Pilte ei salvestata projekti, andmebaasi ega püsivasse Docker-volume'isse.
+  FastAPI võib päringu ajal kasutada ajutist puhvrit, mis päringu lõpus
+  suletakse.
+- API esimeses etapis autentimist ei kasuta.
+
 ## API otspunktid
-1. **`POST /detect`**
-   - **Sisend:** `multipart/form-data` (`file`: pildifail), valikuline query-parameeter `conf` (vaikimisi `0.45`).
+1. **`POST /api/detect`**
+   - **Sisend:** `multipart/form-data` (`file`: pildifail), valikuline
+     query-parameeter `conf`. See on mudeli tuvastuse minimaalne
+     usalduslävend ja selle vaikeväärtus on `0.45`.
    - **Töötlus:** eeltöötlus -> ONNX inferents -> NMS (`iou=0.5`) -> koordinaatide teisendus algse pildi pikslitesse.
    - **Väljund (JSON):**
      ```json
      {
+       "request_received_at": "2026-11-23T19:42:07.123Z",
+       "processing_duration_ms": 612.4,
+       "filename": "kaamera.jpg",
+       "conf": 0.45,
        "image_size": {"width": 1150, "height": 550},
-       "counts": {"car": 0, "bus": 0, "tram": 0},
+       "counts": {"bus": 0, "car": 0, "tram": 0},
        "total": 0,
        "detections": [
          {"class": "tram", "confidence": 0.91, "bbox_xyxy": [412, 310, 895, 425]}
        ]
      }
      ```
-2. **`POST /detect/image`**
-   - **Sisend:** sama mis `/detect`.
-   - **Väljund:** JPEG-pilt (`image/jpeg`), kuhu on joonistatud tuvastatud kastid, klassinimed ja usaldusväärsus.
-3. **`GET /health`**
+2. **`POST /api/detect/image`**
+   - **Sisend:** sama mis `/api/detect`.
+   - **Väljund:** sama JSON mis `/api/detect`, millele lisandub
+     `annotated_image`. Selle `media_type` on `image/jpeg` ja `base64` sisaldab
+     tuvastuskastide, klassinimede ja usaldusväärtustega JPEG-pilti.
+   - Sisendpilt saadetakse tavalise `multipart/form-data` failina. Mudel
+     käivitatakse ühe päringu jooksul ainult üks kord.
+   - Mõlema tuvastusotspunkti `request_received_at` on UTC-s ISO 8601
+     ajatempel, `processing_duration_ms` on valideerimise, eeltöötluse,
+     inferentsi ja järeltöötluse kestus millisekundites ning `filename` on
+     kliendi saadetud failinime basename või selle puudumisel `null`. Väli
+     `conf` näitab päringus tegelikult kasutatud usalduslävendit, sealhulgas
+     `.env` vaikeväärtust, kui query-parameeter puudub.
+3. **`GET /api/health`**
    - Tagastab `{"status": "ok"}`.
 
-## Swagger api kasutamiseks
-- paigalda kohe ka swagger api kasutamiseks
+## Docker-konteiner
 
-## URL
-- paigaldame rakenduse aadressile liiklus.fun-o.eu/api/... 
-- DNS seadistus ei ole selle projekti osa
-- fun-o.eu nginx tuleb seadistada eraldi (tuleb eraldi luba küsida)
-- olemasolev fun-o.eu ssl sert tuleb uuendada ja lisada sinna uus alamdomeen liiklus. Küsi luba, ilma otsese korralduse ja loata ei tohi teha.
+- Rakendus töötab teenuses ja konteineris `liiklus-api`.
+- Uvicorn kasutab ühte worker'it.
+- ONNX Runtime kasutab `.env` väärtuse `ORT_INTRA_OP_NUM_THREADS=3` järgi
+  kolme operaatorite arvutuslõime. Eraldi Docker CPU-piirangut ei rakendata.
+- Mudeli usalduslävendi vaikeväärtus tuleb `.env` muutujast
+  `MODEL_CONFIDENCE_THRESHOLD=0.45`; päringu `conf` võib selle üle kirjutada.
+- Mudelifail ühendatakse konteinerisse read-only mount'ina.
+- Kohalik ligipääs on `http://127.0.0.1:8010`.
+- Konteiner ühendatakse olemasolevasse välisesse `funo_net` võrku.
+
+## Swagger api kasutamiseks
+
+- Swagger UI asub `/api/docs` ja OpenAPI skeem `/api/openapi.json`.
+
+## UI
+
+- Kavandatav avalik API asub aadressil `https://liiklus.fun-o.eu/api/...`.
+- `liiklus.fun-o.eu` DNS-kirje on olemas.
+- `fun_o/nginx/default.conf` sisaldab `liiklus.fun-o.eu` `/api/` proxy
+  seadistust, selle süntaks on kontrollitud ning konfiguratsioon on aktiivne.
+- `fun-o.eu` Let's Encrypt sertifikaat sisaldab `liiklus.fun-o.eu` nime ja
+  kehtib 21. veebruarini 2027. Renewal kasutab hosti Certboti webroot-meetodit.
+- UI töötab eraldi `liiklus-ui` nginx-konteineris; UI-d ei ühendata API
+  rakenduse ega API Docker image'iga.
+- Avalik nginx suunab `/` UI-le ja `/api/` API-le.
+- UI võtab vastu ühe JPEG- või PNG-pildi korraga ja saadab selle otspunktile
+  `POST /api/detect/image`. Brauser ei korda tuvastus-, loendus-, pilditöötlus-
+  ega sisendi piirangute äriloogikat.
+- UI kuvab API tagastatud märgendatud pildi, loendused, metaandmed ja
+  tuvastused. API JSON-vastust saab vaadata eraldi modalis; kuvamiseks loodud
+  koopiast eemaldatakse lennult `annotated_image.base64`, sest pilt kuvatakse
+  eraldi tavavaates. Modali ikoonnupust saab sama JSON-i ilma Base64-väljata
+  `.json` failina alla laadida.
+- UI CSS asub eraldi failis ja kasutab TTÜ-loengu projekti olemasolevat
+  kujunduskeelt. Kasutajaliidese tekstid tulevad eestikeelsest tõlkefailist.
+- UI kuvab tuvastuslävendi seletuses API vaikeväärtuse. Väärtus antakse UI
+  konteinerile Compose'i kaudu samast `MODEL_CONFIDENCE_THRESHOLD`
+  keskkonnamuutujast ega ole brauseri äriloogikas eraldi määratud.
+
+## Autentimise kavand
+
+- Praeguses etapis ei kasutata API ega UI autentimist.
+- `GET /api/health` jääb avalikuks ka pärast teiste API otspunktide
+  autentimise lisamist.
+- UI-le lisatakse hiljem Google'i OIDC-autentimine. Kasutajanime ja parooliga
+  autentimist ei lisata.
+- Google'iga autenditud UI ja välised API kliendid kasutavad eraldi
+  autentimismehhanisme. UI ei hoia brauseris API Basic- ega Bearer-mandaati.
+- Tulevane serveripoolne `/ui-api/` vahendus kontrollib Google'i sessiooni ja
+  edastab päringu samadele olemasolevatele `/api/` otspunktidele.
+- Avaliku API Basic- või Bearer-autentimise valik tehakse hiljem. Bearer on
+  eelistatud suund, kuid käesolevas etapis seda ei rakendata.
 
 ## Failistruktuur ja tarnitavad failid
 - `app.py` – kogu rakenduse loogika
 - `requirements.txt` – minimaalsed teegid
 - `Dockerfile` – kerge `python:3.11-slim` ARM64 konteiner
+- `ui/` – eraldi staatiline UI, CSS, tõlked ja nginx-konteiner
+- `docker-compose.yml` – API ja UI konteinerite käitus, mudeli mount ja `funo_net` võrk
+- `.env.example` – käituskeskkonna seadistuse näidis
 - `README.md` – käivitamise ja `curl` testimise juhend
+- `docs/testid.md` – enne käivitamist ülevaadatav minimaalne testiplaan

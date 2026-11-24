@@ -61,7 +61,11 @@ Koostaja: AI (OpenAI Codex), kasutaja juhiste järgi. Käesoleva dokumendi esime
 
 ### Testimine ja andmete muutmine
 
-- Testid tuleb eelnevalt kokku leppida ja kirjeldada eraldi failis docs/testid.md. Enne ei tohi teste kasutada. 
+- Teste käivitatakse ainult siis, kui kasutaja või ülesande väline
+  vastuvõtukriteerium seda sõnaselgelt nõuab. Teste ei käivitata automaatselt
+  ega tavapärase muudatuse osana.
+- Nõutud testid tuleb eelnevalt kirjeldada failis `docs/testid.md` ja piirata
+  konkreetse muudatuse kontrollimiseks vajaliku ulatusega.
 - Ilma kasutaja eraldi loata ei tohi käivitada teste ega kontrollskripte, mis
   kirjutavad andmebaasi või muudavad olemasolevaid andmeid.
 - Ilma sellise loata on lubatud ainult dry-run'id, lugemispäringud ja muud
@@ -113,8 +117,8 @@ Koostaja: AI (OpenAI Codex), kasutaja juhiste järgi. Käesoleva dokumendi esime
 
 - [`README.md`](../README.md) — rakenduse hetkeseis, käivitamine, väljundid ja piirangud.
 - [`docs/agents.md`](agents.md) — projekti siduvad tööreeglid.
-- [`docs/lahteülesanne.md`](lahteülesanne.md) — rakenduse eesmärk, ulatus ja vastuvõtukriteeriumid.
-...
+- [`docs/lähteülesanne.md`](lähteülesanne.md) — rakenduse eesmärk, ulatus ja vastuvõtukriteeriumid.
+- [`docs/testid.md`](testid.md) — enne käivitamist kooskõlastatav minimaalne testiplaan.
 
 ### Lähte- ja võrdlusmaterjalid
 
@@ -123,8 +127,12 @@ Koostaja: AI (OpenAI Codex), kasutaja juhiste järgi. Käesoleva dokumendi esime
 ### Teostuse põhilised allikad
 
 Registrit tuleb täiendada kohe, kui projektile lisandub README, andmeskeem, API leping, konteinerite kirjeldus, hindamisandmete register või muu asjakohane allikas. Registrisse kuulumine ei anna allikale teiste ees ülimuslikkust.
-- [`docs/todo.md`](todo.md) — rakenduse püsivad tööülesanded ja arendusplaanid.
-...
+- [`app.py`](../app.py) — API ja liiklustuvastuse rakendusloogika.
+- [`docker-compose.yml`](../docker-compose.yml) — konteineri käitus, mudeli mount ja võrk.
+- [`Dockerfile`](../Dockerfile) — rakenduse Docker image'i ehitus.
+- [`.env.example`](../.env.example) — käituskeskkonna seadistuse näidis.
+- [`tests/test_app.py`](../tests/test_app.py) — automatiseeritud API ja eeltöötluse testid.
+- [`requirements-test.txt`](../requirements-test.txt) — testide fikseeritud sõltuvused.
 
 ## 10. Millal mida kindlasti lugeda
 
