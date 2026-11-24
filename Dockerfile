@@ -15,7 +15,7 @@ WORKDIR /app
 COPY requirements.txt ./
 RUN pip install --no-cache-dir --requirement requirements.txt
 
-COPY --chown=app:app app.py ./
+COPY --chown=app:app app.py database.py ./
 
 USER app
 
@@ -34,6 +34,6 @@ COPY --chown=app:app tests ./tests
 
 USER app
 
-CMD ["pytest", "--quiet", "tests"]
+CMD ["python", "-m", "pytest", "--quiet", "tests"]
 
 FROM base AS runtime

@@ -131,6 +131,8 @@ Registrit tuleb täiendada kohe, kui projektile lisandub README, andmeskeem, API
 - [`docker-compose.yml`](../docker-compose.yml) — konteineri käitus, mudeli mount ja võrk.
 - [`Dockerfile`](../Dockerfile) — rakenduse Docker image'i ehitus.
 - [`.env.example`](../.env.example) — käituskeskkonna seadistuse näidis.
+- [`db/erd.md`](../db/erd.md) — Oracle'i aktiivõppe andmemudel, tabelid, seosed ja terviklusreeglid.
+- [`db/schema/001_core_schema.sql`](../db/schema/001_core_schema.sql) — Oracle'i skeemi loomise skript.
 - [`tests/test_app.py`](../tests/test_app.py) — automatiseeritud API ja eeltöötluse testid.
 - [`requirements-test.txt`](../requirements-test.txt) — testide fikseeritud sõltuvused.
 

@@ -15,7 +15,7 @@ Dokumendi koostas algselt inimene. OpenAI Codex täiendas dokumenti 23. novembri
 - [Docker-konteiner](#docker-konteiner)
 - [Swagger](#swagger-api-kasutamiseks)
 - [UI](#ui)
-- [Autentimise kavand](#autentimise-kavand)
+- [Autentimine](#autentimine)
 - [Tarnitavad failid](#failistruktuur-ja-tarnitavad-failid)
 
 ## Eesmärk
@@ -42,10 +42,11 @@ Luua kerge FastAPI rakendus Ubuntu ARM64 serverile, mis võtab vastu kaamerapild
 - Pildifaili maksimaalne suurus on 5 MiB ehk 5 242 880 baiti.
 - Pildi laius korrutatud kõrgusega võib olla kuni 10 000 000 pikslit.
 - Mõõt kontrollitakse kodeeritud pildi päisest enne OpenCV-ga dekodeerimist.
-- Pilte ei salvestata projekti, andmebaasi ega püsivasse Docker-volume'isse.
-  FastAPI võib päringu ajal kasutada ajutist puhvrit, mis päringu lõpus
-  suletakse.
-- API esimeses etapis autentimist ei kasuta.
+- Tavaline tuvastuspäring pilti ei säilita. Kasutaja kinnitatud
+  treeningukandidaat salvestatakse `TRAINING_POOL_DIR` kataloogi; Oracle'is
+  hoitakse metaandmed ja analüüsi JSON.
+- Treeningukandidaadi kustutamisel eemaldatakse pilt ja YOLO märgend kettalt,
+  kuid Oracle'i kirje suletakse soft delete'iga.
 
 ## API otspunktid
 1. **`POST /api/detect`**
@@ -83,6 +84,10 @@ Luua kerge FastAPI rakendus Ubuntu ARM64 serverile, mis võtab vastu kaamerapild
      `.env` vaikeväärtust, kui query-parameeter puudub.
 3. **`GET /api/health`**
    - Tagastab `{"status": "ok"}`.
+4. **Treeningupildi otspunktid**
+   - `/api/training-pool` haldab kandidaate ja nende algpilte.
+   - `/api/training-packages` haldab pakke, piltide seoseid ja ZIP-eksporti.
+   - Täpne andmemudel on failis [`../db/erd.md`](../db/erd.md).
 
 ## Docker-konteiner
 
@@ -124,23 +129,26 @@ Luua kerge FastAPI rakendus Ubuntu ARM64 serverile, mis võtab vastu kaamerapild
 - UI kuvab tuvastuslävendi seletuses API vaikeväärtuse. Väärtus antakse UI
   konteinerile Compose'i kaudu samast `MODEL_CONFIDENCE_THRESHOLD`
   keskkonnamuutujast ega ole brauseri äriloogikas eraldi määratud.
+- Kolme taseme režiimis teeb UI kolm `/api/detect/image` päringut lävenditega
+  `default`, `max(0.01, default - 0.20)` ja
+  `max(0.01, default - 0.40)` ning kuvab kolm tulemust kõrvuti.
+- UI võimaldab märkida pildi treeningukandidaadiks ning koostada kandidaatidest
+  enne esimest allalaadimist muudetavaid treeningpakke.
 
-## Autentimise kavand
+## Autentimine
 
-- Praeguses etapis ei kasutata API ega UI autentimist.
-- `GET /api/health` jääb avalikuks ka pärast teiste API otspunktide
-  autentimise lisamist.
-- UI-le lisatakse hiljem Google'i OIDC-autentimine. Kasutajanime ja parooliga
-  autentimist ei lisata.
-- Google'iga autenditud UI ja välised API kliendid kasutavad eraldi
-  autentimismehhanisme. UI ei hoia brauseris API Basic- ega Bearer-mandaati.
-- Tulevane serveripoolne `/ui-api/` vahendus kontrollib Google'i sessiooni ja
-  edastab päringu samadele olemasolevatele `/api/` otspunktidele.
-- Avaliku API Basic- või Bearer-autentimise valik tehakse hiljem. Bearer on
-  eelistatud suund, kuid käesolevas etapis seda ei rakendata.
+- UI kasutab Google'i autentimist ja serveripoolset sessiooniküpsist.
+- Esmakordsel sisselogimisel luuakse `APP_USERS` kirje rolliga `USER`;
+  praeguses etapis roll tegevusi ei piira.
+- `GET /api/health` ning autentimise alustamise otspunktid on avalikud, muud
+  API otspunktid nõuavad sessiooni.
+- Välise API Basic- või Bearer-autentimine lisatakse hiljem.
 
 ## Failistruktuur ja tarnitavad failid
-- `app.py` – kogu rakenduse loogika
+- `app.py` – API ja tuvastusloogika
+- `database.py` – Oracle'i andmekiht
+- `db/schema/001_core_schema.sql` – käivitatav skeemi loomise skript
+- `db/erd.md` – andmemudel
 - `requirements.txt` – minimaalsed teegid
 - `Dockerfile` – kerge `python:3.11-slim` ARM64 konteiner
 - `ui/` – eraldi staatiline UI, CSS, tõlked ja nginx-konteiner
