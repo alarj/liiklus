@@ -2,22 +2,48 @@ from __future__ import annotations
 
 import ast
 import base64
+import csv
 import hashlib
+import io
+import json
 import os
+import re
+import secrets
 import struct
+import tempfile
 import threading
 import time
+import uuid
+import zipfile
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any
 
 import cv2
+import httpx
 import numpy as np
 import onnxruntime as ort
-from fastapi import FastAPI, File, HTTPException, Query, Request, Response, UploadFile
+from fastapi import (
+    Depends,
+    FastAPI,
+    File,
+    Form,
+    HTTPException,
+    Query,
+    Request,
+    Response,
+    UploadFile,
+    status,
+)
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
+from starlette.background import BackgroundTask
+from starlette.concurrency import run_in_threadpool
+from starlette.middleware.sessions import SessionMiddleware
+
+from database import ConflictError, NotFoundError, OracleRepository, User
 
 
 def _model_confidence_from_environment() -> float:
@@ -26,8 +52,8 @@ def _model_confidence_from_environment() -> float:
         value = float(raw_value)
     except ValueError as exc:
         raise RuntimeError("MODEL_CONFIDENCE_THRESHOLD must be a number") from exc
-    if not 0.0 <= value <= 1.0:
-        raise RuntimeError("MODEL_CONFIDENCE_THRESHOLD must be between 0.0 and 1.0")
+    if not 0.01 <= value <= 1.0:
+        raise RuntimeError("MODEL_CONFIDENCE_THRESHOLD must be between 0.01 and 1.0")
     return value
 
 
@@ -38,6 +64,8 @@ NMS_IOU_THRESHOLD = 0.5
 DEFAULT_MODEL_CONFIDENCE = _model_confidence_from_environment()
 ALLOWED_MEDIA_TYPES = {"image/jpeg", "image/png"}
 EXPECTED_CLASSES = {"bus", "car", "tram"}
+EXPORT_CLASS_IDS = {"bus": 0, "car": 1, "tram": 2}
+GOOGLE_TOKENINFO_URL = "https://oauth2.googleapis.com/tokeninfo"
 JPEG_SOF_MARKERS = {
     0xC0,
     0xC1,
@@ -80,6 +108,8 @@ class DetectionResult(DetectionData):
     processing_duration_ms: float
     filename: str | None
     conf: float
+    model_sha256: str
+    training_history: dict[str, Any] | None = None
 
 
 class AnnotatedImage(BaseModel):
@@ -91,12 +121,31 @@ class DetectionImageResult(DetectionResult):
     annotated_image: AnnotatedImage
 
 
+class GoogleAuthRequest(BaseModel):
+    id_token: str
+
+
+class PackageCreateRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=250)
+
+
+class PackageImagesRequest(BaseModel):
+    image_ids: list[str] = Field(min_length=1)
+
+
 @dataclass(frozen=True)
 class Settings:
     model_path: Path
     ort_intra_op_num_threads: int
     max_upload_bytes: int
     max_image_pixels: int
+    training_pool_dir: Path
+    training_label_confidence: float
+    training_image_max_dimension: int
+    training_jpeg_quality: int
+    training_quick_tags: tuple[str, ...]
+    google_client_id: str
+    session_secret: str
 
     @classmethod
     def from_environment(cls) -> Settings:
@@ -111,6 +160,30 @@ class Settings:
             max_image_pixels=_positive_int_environment(
                 "MAX_IMAGE_PIXELS", 10_000_000
             ),
+            training_pool_dir=Path(
+                os.getenv("TRAINING_POOL_DIR", "/srv/liiklus/training_pool")
+            ).resolve(),
+            training_label_confidence=_float_environment(
+                "TRAINING_LABEL_CONFIDENCE", 0.25, minimum=0.01, maximum=1.0
+            ),
+            training_image_max_dimension=_positive_int_environment(
+                "TRAINING_IMAGE_MAX_DIMENSION", 1280
+            ),
+            training_jpeg_quality=_bounded_int_environment(
+                "TRAINING_JPEG_QUALITY", 90, minimum=1, maximum=100
+            ),
+            training_quick_tags=_string_list_environment(
+                "TRAINING_QUICK_TAGS_JSON",
+                (
+                    "Hämar/öö",
+                    "Sõiduk okste taga",
+                    "Sõiduk puudu",
+                    "Valepositiivne",
+                    "Vihm/lumi",
+                ),
+            ),
+            google_client_id=os.getenv("GOOGLE_CLIENT_ID", "").strip(),
+            session_secret=os.getenv("SESSION_SECRET", "").strip(),
         )
 
 
@@ -139,6 +212,44 @@ def _positive_int_environment(name: str, default: int) -> int:
     if value <= 0:
         raise RuntimeError(f"{name} must be greater than zero")
     return value
+
+
+def _float_environment(
+    name: str, default: float, *, minimum: float, maximum: float
+) -> float:
+    raw_value = os.getenv(name, str(default))
+    try:
+        value = float(raw_value)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be a number") from exc
+    if not minimum <= value <= maximum:
+        raise RuntimeError(f"{name} must be between {minimum} and {maximum}")
+    return value
+
+
+def _bounded_int_environment(
+    name: str, default: int, *, minimum: int, maximum: int
+) -> int:
+    value = _positive_int_environment(name, default)
+    if not minimum <= value <= maximum:
+        raise RuntimeError(f"{name} must be between {minimum} and {maximum}")
+    return value
+
+
+def _string_list_environment(name: str, default: tuple[str, ...]) -> tuple[str, ...]:
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return default
+    try:
+        value = json.loads(raw_value)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"{name} must be a JSON array of strings") from exc
+    if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+        raise RuntimeError(f"{name} must be a JSON array of strings")
+    tags = tuple(dict.fromkeys(item.strip() for item in value if item.strip()))
+    if not tags:
+        raise RuntimeError(f"{name} must contain at least one tag")
+    return tags
 
 
 def _sha256(path: Path) -> str:
@@ -369,6 +480,15 @@ class Detector:
 
     def process(self, file: UploadFile, confidence_threshold: float) -> ProcessedImage:
         data, width, height = _read_upload(file, self.settings)
+        return self.process_bytes(data, width, height, confidence_threshold)
+
+    def process_bytes(
+        self,
+        data: bytes,
+        width: int,
+        height: int,
+        confidence_threshold: float,
+    ) -> ProcessedImage:
         prepared = _decode_and_prepare(data, width, height)
         with self._inference_lock:
             raw_output = self.session.run(
@@ -515,12 +635,16 @@ def _detection_result(
     processing_duration_ms: float,
     filename: str | None,
     confidence_threshold: float,
+    model_sha256: str,
+    training_history: dict[str, Any] | None,
 ) -> DetectionResult:
     return DetectionResult(
         request_received_at=request_received_at,
         processing_duration_ms=round(processing_duration_ms, 3),
         filename=_safe_filename(filename),
         conf=confidence_threshold,
+        model_sha256=model_sha256,
+        training_history=training_history,
         image_size=processed.result.image_size,
         counts=processed.result.counts,
         total=processed.result.total,
@@ -530,9 +654,21 @@ def _detection_result(
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    app.state.detector = Detector(Settings.from_environment())
-    yield
-    del app.state.detector
+    settings = Settings.from_environment()
+    if not settings.session_secret:
+        raise RuntimeError("SESSION_SECRET is required")
+    if not settings.google_client_id:
+        raise RuntimeError("GOOGLE_CLIENT_ID is required")
+    settings.training_pool_dir.mkdir(parents=True, exist_ok=True)
+    app.state.settings = settings
+    app.state.detector = Detector(settings)
+    app.state.repository = OracleRepository.from_env()
+    try:
+        yield
+    finally:
+        app.state.repository.close()
+        del app.state.repository
+        del app.state.detector
 
 
 app = FastAPI(
@@ -544,9 +680,56 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+app.add_middleware(
+    SessionMiddleware,
+    secret_key=os.getenv("SESSION_SECRET", "configure-session-secret"),
+    session_cookie="liiklus_session",
+    same_site="lax",
+    https_only=True,
+    max_age=12 * 60 * 60,
+)
+
 
 def _detector(request: Request) -> Detector:
     return request.app.state.detector
+
+
+def _repository(request: Request) -> OracleRepository:
+    return request.app.state.repository
+
+
+async def current_user(request: Request) -> User:
+    user_id = request.session.get("user_id")
+    if not isinstance(user_id, int):
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Authentication required")
+    try:
+        user = await run_in_threadpool(_repository(request).get_user, user_id)
+    except NotFoundError as exc:
+        request.session.clear()
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Authentication required") from exc
+    if not user.enabled:
+        request.session.clear()
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Account is disabled")
+    return user
+
+
+def _csrf_token(request: Request) -> str:
+    token = request.session.get("csrf_token")
+    if not isinstance(token, str):
+        token = secrets.token_urlsafe(32)
+        request.session["csrf_token"] = token
+    return token
+
+
+def _verify_csrf(request: Request) -> None:
+    expected = request.session.get("csrf_token")
+    supplied = request.headers.get("X-CSRF-Token")
+    if (
+        not isinstance(expected, str)
+        or not isinstance(supplied, str)
+        or not secrets.compare_digest(expected, supplied)
+    ):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Invalid CSRF token")
 
 
 @app.get("/api/health")
@@ -554,30 +737,120 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
-@app.post("/api/detect", response_model=DetectionResult)
+async def _verify_google_id_token(id_token: str, client_id: str) -> dict[str, Any]:
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            response = await client.get(
+                GOOGLE_TOKENINFO_URL, params={"id_token": id_token}
+            )
+    except httpx.RequestError as exc:
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, "Google is unavailable") from exc
+    if response.status_code >= 400:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Google login failed")
+    try:
+        profile = response.json()
+    except ValueError as exc:
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, "Google is unavailable") from exc
+    if (
+        not isinstance(profile, dict)
+        or profile.get("aud") != client_id
+        or profile.get("email_verified") not in (True, "true")
+        or not isinstance(profile.get("sub"), str)
+        or not isinstance(profile.get("email"), str)
+    ):
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Google login failed")
+    return profile
+
+
+@app.get("/api/auth/google/config")
+def google_config(request: Request) -> dict[str, str]:
+    return {"client_id": request.app.state.settings.google_client_id}
+
+
+@app.post("/api/auth/google")
+async def google_login(body: GoogleAuthRequest, request: Request) -> dict[str, bool]:
+    profile = await _verify_google_id_token(
+        body.id_token, request.app.state.settings.google_client_id
+    )
+    email = str(profile["email"]).strip().lower()
+    user = await run_in_threadpool(
+        _repository(request).get_or_create_google_user,
+        str(profile["sub"]),
+        email,
+        str(profile.get("name") or email),
+    )
+    if not user.enabled:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Account is disabled")
+    request.session.clear()
+    request.session["user_id"] = user.user_id
+    request.session["csrf_token"] = secrets.token_urlsafe(32)
+    return {"ok": True}
+
+
+@app.get("/api/auth/me")
+def auth_me(request: Request, user: Annotated[User, Depends(current_user)]) -> dict[str, Any]:
+    return {
+        "public_id": user.public_id,
+        "email": user.email,
+        "display_name": user.display_name,
+        "role": user.role_code,
+        "csrf_token": _csrf_token(request),
+        "training_quick_tags": request.app.state.settings.training_quick_tags,
+    }
+
+
+@app.post("/api/auth/logout")
+def auth_logout(
+    request: Request, user: Annotated[User, Depends(current_user)]
+) -> dict[str, bool]:
+    del user
+    _verify_csrf(request)
+    request.session.clear()
+    return {"ok": True}
+
+
+def _detect_upload(
+    request: Request, file: UploadFile, confidence_threshold: float
+) -> tuple[ProcessedImage, dict[str, Any] | None]:
+    detector = _detector(request)
+    data, width, height = _read_upload(file, detector.settings)
+    processed = detector.process_bytes(data, width, height, confidence_threshold)
+    history = _repository(request).training_history(hashlib.sha256(data).hexdigest())
+    return processed, history
+
+
+@app.post(
+    "/api/detect",
+    response_model=DetectionResult,
+    response_model_exclude_none=True,
+)
 def detect(
     request: Request,
     response: Response,
     file: Annotated[UploadFile, File(description="JPEG or PNG image")],
+    user: Annotated[User, Depends(current_user)],
     conf: Annotated[
         float,
         Query(
-            ge=0.0,
+            ge=0.01,
             le=1.0,
             description="Minimum model confidence required for a detection",
         ),
     ] = DEFAULT_MODEL_CONFIDENCE,
 ) -> DetectionResult:
+    del user
     request_received_at = datetime.now(timezone.utc)
     processing_started_at = time.perf_counter()
     detector = _detector(request)
-    processed = detector.process(file, conf)
+    processed, history = _detect_upload(request, file, conf)
     result = _detection_result(
         processed,
         request_received_at,
         (time.perf_counter() - processing_started_at) * 1000,
         file.filename,
         conf,
+        detector.model_sha256,
+        history,
     )
     response.headers["X-Model-SHA256"] = detector.model_sha256
     return result
@@ -586,24 +859,27 @@ def detect(
 @app.post(
     "/api/detect/image",
     response_model=DetectionImageResult,
+    response_model_exclude_none=True,
 )
 def detect_image(
     request: Request,
     response: Response,
     file: Annotated[UploadFile, File(description="JPEG or PNG image")],
+    user: Annotated[User, Depends(current_user)],
     conf: Annotated[
         float,
         Query(
-            ge=0.0,
+            ge=0.01,
             le=1.0,
             description="Minimum model confidence required for a detection",
         ),
     ] = DEFAULT_MODEL_CONFIDENCE,
 ) -> DetectionImageResult:
+    del user
     request_received_at = datetime.now(timezone.utc)
     processing_started_at = time.perf_counter()
     detector = _detector(request)
-    processed = detector.process(file, conf)
+    processed, history = _detect_upload(request, file, conf)
     annotated_jpeg = _annotate(processed.original, processed.result.detections)
     result = _detection_result(
         processed,
@@ -611,6 +887,8 @@ def detect_image(
         (time.perf_counter() - processing_started_at) * 1000,
         file.filename,
         conf,
+        detector.model_sha256,
+        history,
     )
     response.headers["X-Model-SHA256"] = detector.model_sha256
     return DetectionImageResult(
@@ -619,4 +897,411 @@ def detect_image(
             media_type="image/jpeg",
             base64=base64.b64encode(annotated_jpeg).decode("ascii"),
         ),
+    )
+
+
+def _parse_tags(raw_tags: str) -> list[str]:
+    try:
+        value = json.loads(raw_tags)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Invalid tags") from exc
+    if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Invalid tags")
+    return list(dict.fromkeys(item.strip() for item in value if item.strip()))
+
+
+def _prepare_training_image(
+    data: bytes,
+    media_type: str,
+    width: int,
+    height: int,
+    settings: Settings,
+) -> tuple[bytes, str, str, int, int]:
+    if max(width, height) <= settings.training_image_max_dimension:
+        extension = ".png" if media_type == "image/png" else ".jpg"
+        return data, media_type, extension, width, height
+    image = cv2.imdecode(np.frombuffer(data, dtype=np.uint8), cv2.IMREAD_COLOR)
+    if image is None:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Image could not be decoded")
+    scale = settings.training_image_max_dimension / max(width, height)
+    stored_width = max(1, round(width * scale))
+    stored_height = max(1, round(height * scale))
+    resized = cv2.resize(
+        image, (stored_width, stored_height), interpolation=cv2.INTER_AREA
+    )
+    encoded, jpeg = cv2.imencode(
+        ".jpg", resized, [cv2.IMWRITE_JPEG_QUALITY, settings.training_jpeg_quality]
+    )
+    if not encoded:
+        raise RuntimeError("Training JPEG encoding failed")
+    return jpeg.tobytes(), "image/jpeg", ".jpg", stored_width, stored_height
+
+
+def _training_filename(public_id: str, original_filename: str, extension: str) -> str:
+    stem = Path(original_filename).stem
+    safe_stem = re.sub(r"[^A-Za-z0-9._-]+", "-", stem).strip(".-")[:100]
+    return f"{public_id}_{safe_stem or 'image'}{extension}"
+
+
+def _yolo_labels(result: DetectionData) -> str:
+    width = result.image_size.width
+    height = result.image_size.height
+    lines: list[str] = []
+    for detection in result.detections:
+        x1, y1, x2, y2 = detection.bbox_xyxy
+        x_center = ((x1 + x2) / 2.0) / width
+        y_center = ((y1 + y2) / 2.0) / height
+        box_width = (x2 - x1) / width
+        box_height = (y2 - y1) / height
+        lines.append(
+            f"{EXPORT_CLASS_IDS[detection.class_name]} "
+            f"{x_center:.6f} {y_center:.6f} {box_width:.6f} {box_height:.6f}"
+        )
+    return "\n".join(lines) + ("\n" if lines else "")
+
+
+def _pool_path(settings: Settings, relative_path: str) -> Path:
+    target = (settings.training_pool_dir / relative_path).resolve()
+    if target.parent != settings.training_pool_dir:
+        raise RuntimeError("Invalid training pool path")
+    return target
+
+
+@app.post("/api/training-pool", status_code=status.HTTP_201_CREATED)
+def create_training_candidate(
+    request: Request,
+    file: Annotated[UploadFile, File(description="JPEG or PNG image")],
+    reason: Annotated[str, Form(max_length=2000)] = "",
+    tags: Annotated[str, Form()] = "[]",
+    user: User = Depends(current_user),
+) -> dict[str, Any]:
+    _verify_csrf(request)
+    reason = reason.strip()
+    settings: Settings = request.app.state.settings
+    source_data, source_width, source_height = _read_upload(file, settings)
+    source_sha256 = hashlib.sha256(source_data).hexdigest()
+    history = _repository(request).training_history(source_sha256)
+    if history and any(item["file_available"] for item in history["selections"]):
+        raise HTTPException(status.HTTP_409_CONFLICT, "Image is already a training candidate")
+    original_filename = _safe_filename(file.filename) or "image"
+    stored_data, stored_media_type, extension, stored_width, stored_height = (
+        _prepare_training_image(
+            source_data,
+            file.content_type or "",
+            source_width,
+            source_height,
+            settings,
+        )
+    )
+    detector = _detector(request)
+    processed = detector.process_bytes(
+        stored_data,
+        stored_width,
+        stored_height,
+        settings.training_label_confidence,
+    )
+    public_id = str(uuid.uuid4())
+    image_relative_path = _training_filename(public_id, original_filename, extension)
+    label_relative_path = f"{Path(image_relative_path).stem}.txt"
+    image_path = _pool_path(settings, image_relative_path)
+    label_path = _pool_path(settings, label_relative_path)
+    image_temp = image_path.with_name(f".{image_path.name}.tmp")
+    label_temp = label_path.with_name(f".{label_path.name}.tmp")
+    try:
+        image_temp.write_bytes(stored_data)
+        label_temp.write_text(_yolo_labels(processed.result), encoding="utf-8")
+        image_temp.replace(image_path)
+        label_temp.replace(label_path)
+        _repository(request).create_training_image(
+            {
+                "public_id": public_id,
+                "candidate_by_user_id": user.user_id,
+                "original_filename": original_filename,
+                "image_relative_path": image_relative_path,
+                "label_relative_path": label_relative_path,
+                "source_media_type": file.content_type,
+                "stored_media_type": stored_media_type,
+                "source_size_bytes": len(source_data),
+                "stored_size_bytes": len(stored_data),
+                "source_width": source_width,
+                "source_height": source_height,
+                "stored_width": stored_width,
+                "stored_height": stored_height,
+                "source_sha256": source_sha256,
+                "stored_sha256": hashlib.sha256(stored_data).hexdigest(),
+                "reason": reason or None,
+                "tags_json": _parse_tags(tags),
+                "analysis_json": {
+                    "conf": settings.training_label_confidence,
+                    "image_size": processed.result.image_size.model_dump(),
+                    "counts": processed.result.counts,
+                    "total": processed.result.total,
+                    "detections": [
+                        item.model_dump(by_alias=True) for item in processed.result.detections
+                    ],
+                },
+                "model_sha256": detector.model_sha256,
+                "label_confidence": settings.training_label_confidence,
+            }
+        )
+    except ConflictError as exc:
+        image_temp.unlink(missing_ok=True)
+        label_temp.unlink(missing_ok=True)
+        image_path.unlink(missing_ok=True)
+        label_path.unlink(missing_ok=True)
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+    except Exception:
+        image_temp.unlink(missing_ok=True)
+        label_temp.unlink(missing_ok=True)
+        image_path.unlink(missing_ok=True)
+        label_path.unlink(missing_ok=True)
+        raise
+    return {
+        "id": public_id,
+        "candidate_at": datetime.now(timezone.utc),
+        "candidate_by": user.display_name or user.email,
+    }
+
+
+@app.get("/api/training-pool")
+def list_training_candidates(
+    request: Request,
+    user: Annotated[User, Depends(current_user)],
+    q: str = "",
+    package: str = "",
+    limit: Annotated[int, Query(ge=1, le=200)] = 100,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> dict[str, Any]:
+    del user
+    result = _repository(request).list_training_images(
+        q.strip(), limit, offset, package.strip()
+    )
+    for item in result["items"]:
+        item.pop("image_relative_path", None)
+        tags = item.pop("tags_json", None) or []
+        if isinstance(tags, str):
+            try:
+                tags = json.loads(tags)
+            except json.JSONDecodeError:
+                tags = []
+        item["tags"] = tags if isinstance(tags, list) else []
+        analysis = item.pop("analysis_json", None) or {}
+        if isinstance(analysis, str):
+            try:
+                analysis = json.loads(analysis)
+            except json.JSONDecodeError:
+                analysis = {}
+        item["detections_summary"] = {
+            "counts": analysis.get("counts", {}),
+            "total": analysis.get("total", 0),
+        }
+    return result
+
+
+@app.get("/api/training-pool/{image_id}/image")
+def training_candidate_image(
+    image_id: str,
+    request: Request,
+    user: Annotated[User, Depends(current_user)],
+    thumbnail: bool = False,
+) -> Response:
+    del user
+    try:
+        item = _repository(request).get_training_image(image_id)
+    except NotFoundError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+    path = _pool_path(request.app.state.settings, item["image_relative_path"])
+    if not path.is_file():
+        raise HTTPException(status.HTTP_410_GONE, "Training image file is missing")
+    if not thumbnail:
+        return FileResponse(path, media_type=item["stored_media_type"])
+    image = cv2.imread(str(path), cv2.IMREAD_COLOR)
+    if image is None:
+        raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "Image could not be read")
+    height, width = image.shape[:2]
+    scale = min(1.0, 320 / max(width, height))
+    if scale < 1.0:
+        image = cv2.resize(
+            image, (round(width * scale), round(height * scale)), interpolation=cv2.INTER_AREA
+        )
+    encoded, jpeg = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, 82])
+    if not encoded:
+        raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "Thumbnail failed")
+    return Response(jpeg.tobytes(), media_type="image/jpeg")
+
+
+@app.delete("/api/training-pool/{image_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_training_candidate(
+    image_id: str,
+    request: Request,
+    user: Annotated[User, Depends(current_user)],
+) -> Response:
+    del user
+    _verify_csrf(request)
+    try:
+        item = _repository(request).close_training_image(image_id)
+    except NotFoundError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+    settings: Settings = request.app.state.settings
+    _pool_path(settings, item["image_relative_path"]).unlink(missing_ok=True)
+    _pool_path(settings, item["label_relative_path"]).unlink(missing_ok=True)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@app.post("/api/training-packages", status_code=status.HTTP_201_CREATED)
+def create_training_package(
+    body: PackageCreateRequest,
+    request: Request,
+    user: Annotated[User, Depends(current_user)],
+) -> dict[str, Any]:
+    _verify_csrf(request)
+    name = body.name.strip()
+    if not name:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Package name is required")
+    try:
+        return _repository(request).create_training_package(name, user.user_id)
+    except ConflictError as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+
+
+@app.get("/api/training-packages")
+def list_training_packages(
+    request: Request, user: Annotated[User, Depends(current_user)]
+) -> list[dict[str, Any]]:
+    del user
+    return _repository(request).list_training_packages()
+
+
+@app.get("/api/training-packages/{package_id}")
+def get_training_package(
+    package_id: str,
+    request: Request,
+    user: Annotated[User, Depends(current_user)],
+) -> dict[str, Any]:
+    del user
+    try:
+        package = _repository(request).package_export_snapshot(package_id)
+    except NotFoundError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+    package["items"] = [
+        {
+            "id": item["public_id"],
+            "original_filename": item["original_filename"],
+            "added_at": item["added_at"],
+            "added_by": item["added_by_name"] or item["added_by_email"],
+            "file_available": item["end_date"] is None,
+        }
+        for item in package["items"]
+    ]
+    return package
+
+
+@app.post("/api/training-packages/{package_id}/images")
+def add_training_package_images(
+    package_id: str,
+    body: PackageImagesRequest,
+    request: Request,
+    user: Annotated[User, Depends(current_user)],
+) -> dict[str, Any]:
+    _verify_csrf(request)
+    try:
+        return _repository(request).add_images_to_package(
+            package_id, body.image_ids, user.user_id
+        )
+    except NotFoundError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+    except ConflictError as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+
+
+@app.delete("/api/training-packages/{package_id}/images/{image_id}", status_code=204)
+def remove_training_package_image(
+    package_id: str,
+    image_id: str,
+    request: Request,
+    user: Annotated[User, Depends(current_user)],
+) -> Response:
+    del user
+    _verify_csrf(request)
+    try:
+        _repository(request).remove_image_from_package(package_id, image_id)
+    except NotFoundError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+    except ConflictError as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+    return Response(status_code=204)
+
+
+def _safe_archive_name(name: str) -> str:
+    value = re.sub(r"[^A-Za-z0-9._-]+", "-", name).strip(".-")
+    return value or "training-package"
+
+
+def _delete_file(path: str) -> None:
+    Path(path).unlink(missing_ok=True)
+
+
+@app.post("/api/training-packages/{package_id}/download")
+def download_training_package(
+    package_id: str,
+    request: Request,
+    user: Annotated[User, Depends(current_user)],
+) -> FileResponse:
+    _verify_csrf(request)
+    try:
+        package = _repository(request).package_export_snapshot(package_id)
+    except NotFoundError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+    items = package["items"]
+    if not items:
+        raise HTTPException(status.HTTP_409_CONFLICT, "Training package is empty")
+    settings: Settings = request.app.state.settings
+    temporary = tempfile.NamedTemporaryFile(prefix="liiklus-training-", suffix=".zip", delete=False)
+    temporary.close()
+    try:
+        with zipfile.ZipFile(temporary.name, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr("classes.txt", "bus\ncar\ntram\n")
+            manifest_buffer = io.StringIO()
+            writer = csv.writer(manifest_buffer)
+            writer.writerow(
+                ["id", "filename", "original_filename", "candidate_at", "reason", "candidate_by"]
+            )
+            for item in items:
+                if item["end_date"] is not None:
+                    raise ConflictError("Training package contains a deleted image")
+                image_path = _pool_path(settings, item["image_relative_path"])
+                label_path = _pool_path(settings, item["label_relative_path"])
+                if not image_path.is_file() or not label_path.is_file():
+                    raise ConflictError("Training package contains a missing file")
+                archive.write(image_path, arcname=image_path.name)
+                archive.write(label_path, arcname=label_path.name)
+                writer.writerow(
+                    [
+                        item["public_id"],
+                        image_path.name,
+                        item["original_filename"],
+                        item["created"],
+                        item["reason"],
+                        item["candidate_by_name"],
+                    ]
+                )
+            archive.writestr("manifest.csv", manifest_buffer.getvalue())
+        _repository(request).record_package_download(
+            package_id, user.user_id, [str(item["public_id"]) for item in items]
+        )
+    except (ConflictError, NotFoundError) as exc:
+        _delete_file(temporary.name)
+        status_code = (
+            status.HTTP_404_NOT_FOUND if isinstance(exc, NotFoundError) else status.HTTP_409_CONFLICT
+        )
+        raise HTTPException(status_code, str(exc)) from exc
+    except Exception:
+        _delete_file(temporary.name)
+        raise
+    filename = f"{_safe_archive_name(package['package_name'])}.zip"
+    return FileResponse(
+        temporary.name,
+        media_type="application/zip",
+        filename=filename,
+        background=BackgroundTask(_delete_file, temporary.name),
     )

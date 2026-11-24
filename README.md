@@ -14,10 +14,10 @@ tehniliste otsuste põhjal.
 - [7. UI kasutamine](#7-ui-kasutamine)
 - [8. Sisendi piirangud](#8-sisendi-piirangud)
 - [9. Piltide ja mudeli säilitamine](#9-piltide-ja-mudeli-säilitamine)
-- [10. Autentimise kavand](#10-autentimise-kavand)
+- [10. Autentimine](#10-autentimine)
 - [11. Keskkonnamuutujad](#11-keskkonnamuutujad)
 - [12. Testid](#12-testid)
-- [13. Praegune kontrollimise seis](#13-praegune-kontrollimise-seis)
+- [13. Kontrollimine](#13-kontrollimine)
 
 ## 3. Ülevaade
 
@@ -25,16 +25,17 @@ FastAPI rakendus loendab JPEG- või PNG-pildilt ONNX-mudeliga busse, autosid
 ja tramme. API tagastab JSON-vastuse; visualiseeringu otspunkt lisab samasse
 vastusesse Base64-kujul tuvastuskastidega JPEG-pildi.
 
-Eraldi `liiklus-ui` konteiner serveerib staatilist HTML-, CSS- ja
-JavaScript-liidest. UI saadab ühe pildi korraga olemasolevale
-`POST /api/detect/image` otspunktile ning ei teosta tuvastus- ega
-loendusloogikat brauseris uuesti.
+Eraldi `liiklus-ui` konteiner serveerib Google'i sisselogimisega staatilist
+liidest. UI kasutab sama FastAPI JSON API-t tuvastuseks, treeningukandidaatideks
+ja treeningpakkideks.
 
 Otspunktid:
 
 - `GET /api/health`
 - `POST /api/detect`
 - `POST /api/detect/image`
+- `/api/training-pool...`
+- `/api/training-packages...`
 - `GET /api/docs`
 
 ## 4. Eeldused
@@ -42,6 +43,8 @@ Otspunktid:
 - Docker koos Compose'i toega.
 - Olemasolev väline Docker-võrk `funo_net`.
 - Mudelifail `models/best.onnx`; mudelifaile Git-is ei hoita.
+- Oracle'i skeem on loodud skriptiga `db/schema/001_core_schema.sql`.
+- `TRAINING_POOL_DIR` kataloog on API konteineri kasutajale kirjutatav.
 
 Mudeli praegune SHA-256 kontrollsumma on:
 
@@ -81,23 +84,8 @@ Health:
 curl http://127.0.0.1:8010/api/health
 ```
 
-JSON-tuvastus:
-
-```bash
-curl -X POST \
-  "http://127.0.0.1:8010/api/detect?conf=0.45" \
-  -H "accept: application/json" \
-  -F "file=@/tee/pildini.jpg;type=image/jpeg"
-```
-
-JSON koos märgendatud JPEG-iga:
-
-```bash
-curl -X POST \
-  "http://127.0.0.1:8010/api/detect/image?conf=0.45" \
-  -H "accept: application/json" \
-  -F "file=@/tee/pildini.jpg;type=image/jpeg"
-```
+Muud otspunktid nõuavad Google'i sisselogimisel loodud sessiooni. API leping
+on OpenAPI vaates `/api/docs`.
 
 Mõlemad tuvastusotspunktid tagastavad UTC-välja `request_received_at`,
 millisekundites `processing_duration_ms`, kliendi antud failinime `filename`,
@@ -110,66 +98,39 @@ käivitatakse mudel üks kord.
 
 ## 7. UI kasutamine
 
-UI võimaldab valida või lohistada ühe JPEG- või PNG-pildi, vaadata algpildi
-eelvaadet ning saata pildi API-le. Usalduslävendi võib jätta tühjaks; sel juhul
-kasutab API oma vaikeväärtust. Samuti võib sisestada väärtuse vahemikus `0`
-kuni `1`.
+UI võimaldab analüüsida pilti ühe lävendiga või kolme `.env` vaikeväärtusest
+tuletatud lävendiga. Kolme taseme tulemused kuvatakse kõrvuti.
 
 UI nimetab parameetrit tuvastuslävendiks ja kuvab selgituses API
 vaikeväärtuse. `liiklus-ui` konteiner saab väärtuse Compose'i kaudu samast
 `MODEL_CONFIDENCE_THRESHOLD` keskkonnamuutujast; brauser ei otsusta ise API
 vaikeväärtust.
 
-Tulemusvaade kasutab ainult API vastust ja kuvab:
-
-- märgendatud JPEG-pildi;
-- API tagastatud klasside loendused ja koguarvu;
-- pildi mõõdu, kasutatud lävendi, töötlusaja ja päringu aja;
-- üksikud tuvastused koos usaldusväärtuste ja koordinaatidega;
-- eraldi modalis vormindatud JSON-vastuse, millest eemaldatakse kuvamise ajaks
-  `annotated_image.base64`. Märgendatud pilt kuvatakse tavavaates. Modali
-  ikoonnupp laadib sama, ilma Base64-väljata JSON-i `.json` failina alla.
-
-UI tekstid asuvad failis `ui/assets/i18n/et.json`. Kujundus lähtub
-TTÜ-loengu projekti värvidest, tüpograafiast, kaartidest ja vormielementidest;
-UI CSS jääb eraldi faili `ui/assets/app.css`.
+Treeninguvaates saab kandidaate otsida, kustutada, lisada unikaalse nimega
+pakki ning paki Roboflow jaoks ZIP-ina alla laadida. Esimene allalaadimine
+lukustab paki koosseisu.
 
 ## 8. Sisendi piirangud
 
 - Lubatud MIME-tüübid: `image/jpeg` ja `image/png`.
 - Maksimaalne failisuurus: 5 MiB ehk 5 242 880 baiti.
 - Maksimaalne pikslite arv: 10 000 000.
-- `conf` on mudeli tuvastuse minimaalne usalduslävend. Selle lubatud vahemik
-  on `0.0` kuni `1.0` ja vaikeväärtus `0.45`.
+- `conf` lubatud vahemik on `0.01` kuni `1.0`.
 
 ## 9. Piltide ja mudeli säilitamine
 
-Üleslaetud pilte ei kirjutata projekti, andmebaasi ega püsivasse volume'isse.
-Päringu ajal võib FastAPI kasutada operatsioonisüsteemi ajutist puhvrit, mis
-suletakse päringu lõppedes. Märgendatud vastus kodeeritakse mälus.
+Tavalist tuvastuspilti ei säilitata. Kinnitatud treeningukandidaadi kastideta
+pilt ja YOLO `.txt` salvestatakse `TRAINING_POOL_DIR` kataloogi; metadata ja
+analüüsi JSON salvestatakse Oracle'isse.
 
 Mudelifail ühendatakse konteinerisse kirjutuskaitstud failina:
 `./models/best.onnx:/app/models/best.onnx:ro`.
 
-## 10. Autentimise kavand
+## 10. Autentimine
 
-Praeguses etapis ei ole API-l ega UI-l autentimist. `GET /api/health` jääb ka
-pärast autentimise lisamist avalikuks.
-
-Tulevikus lisatakse UI-le Google'i OIDC-autentimine; eraldi kasutajanime ja
-parooliga sisselogimist ei tehta. Brauser kasutab serveripoolset turvalist
-sessiooniküpsist. Google'i tokenit ega API mandaati ei salvestata UI
-JavaScripti ega `localStorage`'isse.
-
-UI ja väliste API klientide autentimine jäävad eraldi usalduspiirideks.
-Google'iga autenditud UI päringud saab suunata serveripoolse `/ui-api/`
-vahenduse kaudu samadele olemasolevatele `/api/` otspunktidele. Avaliku API
-Basic- või Bearer-autentimise otsus tehakse hiljem; eelistatud suund on
-Bearer, kuid seda ei rakendata käesolevas etapis.
-
-Kõik UI API-kõned on koondatud ühte JavaScripti funktsiooni ja API baastee
-ühte konstanti, et tulevane `/api` -> `/ui-api` üleminek ei mõjutaks muud UI
-loogikat.
+UI kasutab Google'i ID-tokenit ainult sisselogimiseks. API kontrollib tokenit,
+loob `USER` rolliga `APP_USERS` kirje ja kasutab edaspidi turvalist
+sessiooniküpsist. `GET /api/health` jääb avalikuks.
 
 ## 11. Keskkonnamuutujad
 
@@ -180,6 +141,10 @@ loogikat.
 | `MODEL_CONFIDENCE_THRESHOLD` | `0.45` | Mudeli usalduslävendi vaikeväärtus |
 | `MAX_UPLOAD_BYTES` | `5242880` | Pildifaili maksimaalne suurus baitides |
 | `MAX_IMAGE_PIXELS` | `10000000` | Pildi maksimaalne pikslite arv |
+| `TRAINING_POOL_DIR` | `/srv/liiklus/training_pool` | Treeningfailide kataloog |
+| `TRAINING_LABEL_CONFIDENCE` | `0.25` | YOLO eelmärgenduse lävend |
+| `ORACLE_USER`, `ORACLE_PASSWORD`, `ORACLE_DSN` | puudub | Oracle'i ühendus |
+| `GOOGLE_CLIENT_ID`, `SESSION_SECRET` | puudub | Google'i sisselogimine ja sessioon |
 
 ## 12. Testid
 
@@ -192,15 +157,7 @@ sõnaselgelt nõuab. Nõutud testide käsk on:
 docker compose --profile testing run --rm testing
 ```
 
-## 13. Praegune kontrollimise seis
+## 13. Kontrollimine
 
-Tootmis-API ja eraldi `liiklus-ui` konteiner töötavad. Avalik nginx suunab
-`https://liiklus.fun-o.eu/` UI-le ning `/api/` API-le; avalik health vastab
-ootuspäraselt. UI image, konteineri nginx, ühine nginx ja avalikud põhifailid
-on kontrollitud.
-
-API 7 automatiseeritud testi läbisid ajutise `PYTHONPATH=/app` keskkonnaga.
-Dokumenteeritud testikäsul puudub testikonteineris püsiv `PYTHONPATH`, mistõttu
-see vajab enne parandamist eraldi otsust. Serveris polnud automatiseeritud
-visuaalkontrolliks Chromiumit ega Playwrighti. Täpsed tulemused ja piirangud on
+Kontrollimise ajalugu ja enne järgmist testikäivitust kooskõlastatav plaan on
 failis [`docs/testid.md`](docs/testid.md).

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import base64
+import os
 import struct
 from datetime import datetime
 from io import BytesIO
+from unittest.mock import patch
 
 import cv2
 import numpy as np
@@ -15,10 +17,39 @@ from starlette.datastructures import Headers, UploadFile
 import app as traffic_app
 
 
+class FakeRepository:
+    def close(self) -> None:
+        pass
+
+    def training_history(self, source_sha256: str) -> None:
+        del source_sha256
+        return None
+
+
+TEST_USER = traffic_app.User(
+    user_id=1,
+    public_id="00000000-0000-0000-0000-000000000001",
+    email="user@example.test",
+    display_name="Test User",
+    role_code="USER",
+    enabled=True,
+)
+
+
 @pytest.fixture(scope="module")
 def client() -> TestClient:
-    with TestClient(traffic_app.app) as test_client:
-        yield test_client
+    environment = {
+        "GOOGLE_CLIENT_ID": "test.apps.googleusercontent.com",
+        "SESSION_SECRET": "test-session-secret",
+        "TRAINING_POOL_DIR": "/tmp/liiklus-test-training-pool",
+    }
+    traffic_app.app.dependency_overrides[traffic_app.current_user] = lambda: TEST_USER
+    with patch.dict(os.environ, environment), patch.object(
+        traffic_app.OracleRepository, "from_env", return_value=FakeRepository()
+    ):
+        with TestClient(traffic_app.app) as test_client:
+            yield test_client
+    traffic_app.app.dependency_overrides.clear()
 
 
 def _encode(image: np.ndarray, extension: str) -> bytes:
@@ -42,6 +73,19 @@ def _settings() -> traffic_app.Settings:
         ort_intra_op_num_threads=3,
         max_upload_bytes=5 * 1024 * 1024,
         max_image_pixels=10_000_000,
+        training_pool_dir=traffic_app.Path("/tmp/liiklus-test-training-pool"),
+        training_label_confidence=0.25,
+        training_image_max_dimension=1280,
+        training_jpeg_quality=90,
+        training_quick_tags=(
+            "Hämar/öö",
+            "Sõiduk okste taga",
+            "Sõiduk puudu",
+            "Valepositiivne",
+            "Vihm/lumi",
+        ),
+        google_client_id="test.apps.googleusercontent.com",
+        session_secret="test-session-secret",
     )
 
 
@@ -134,17 +178,19 @@ def test_detection_endpoints_with_synthetic_image(
     data = _encode(image, ".jpg")
     files = {"file": ("blank.jpg", data, "image/jpeg")}
     process_calls = 0
-    original_process = client.app.state.detector.process
+    original_process = client.app.state.detector.process_bytes
 
-    def counted_process(
-        file: UploadFile,
+    def counted_process_bytes(
+        image_data: bytes,
+        width: int,
+        height: int,
         confidence_threshold: float,
     ) -> traffic_app.ProcessedImage:
         nonlocal process_calls
         process_calls += 1
-        return original_process(file, confidence_threshold)
+        return original_process(image_data, width, height, confidence_threshold)
 
-    monkeypatch.setattr(client.app.state.detector, "process", counted_process)
+    monkeypatch.setattr(client.app.state.detector, "process_bytes", counted_process_bytes)
 
     json_response = client.post("/api/detect", files=files)
 
