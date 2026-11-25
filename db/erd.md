@@ -113,4 +113,10 @@ erDiagram
   uuemast kirjest.
 - Pilt ja YOLO `.txt` asuvad kettal. Pildi kustutamisel failid eemaldatakse,
   kuid Oracle'i metaandmed ja pakiseosed säilivad soft delete'iga.
+- `TRAINING_IMAGES.analysis_json` sisaldab eelmärgenduseks kasutatud mudeli
+  failinime ja kontrollsummat; `model_sha256` veerg säilitab kontrollsumma ka
+  eraldi auditeeritava väärtusena.
+- Kõigi `DATE` ja `TIMESTAMP` väärtuste autoriteetne ajavöönd on UTC. API
+  lisab Oracle'ist loetud ajatemplitele UTC-ajavööndi enne JSON-väljundit ning
+  UI kuvab need brauseri kohalikus ajavööndis.
 

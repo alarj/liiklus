@@ -41,8 +41,9 @@ nginx-liidestuse ja avalike HTTP-vastuste kontrollid.
    10 000 000 piksliga pilt lükatakse tagasi.
 3. **Pärispildi JSON.** Saata kasutaja antud JPEG- või PNG-pilt otspunktile
    `POST /api/detect`; kontrollida UTC ajatemplit, töötluskestust, failinime,
-   tegelikult kasutatud `conf` väärtust, klassinimesid, koordinaate ja
-   `X-Model-SHA256` päist.
+   tegelikult kasutatud `conf` ja `model` väärtust, klassinimesid, koordinaate,
+   `model_sha256` välja ja `X-Model-SHA256` päist. Kontrollida vaikemudelit,
+   teise lubatud mudeli valikut ja tundmatu mudeli tagasilükkamist.
 4. **Pärispildi visualiseering.** Saata sama pilt otspunktile
    `POST /api/detect/image`; kontrollida, et vastus sisaldab sama tuvastuse
    JSON-i ning `annotated_image.base64` dekodeerub avatavaks JPEG-iks, mille
@@ -54,7 +55,11 @@ nginx-liidestuse ja avalike HTTP-vastuste kontrollid.
 6. **UI põhitöövoog.** Avada UI laua- ja mobiilivaates, valida ning lohistada
    pilt, teha päring API vaike-lävendiga ja kasutaja antud lävendiga ning
    kontrollida laadimis-, vea- ja tulemusolekuid. Kinnitada, et tulemus kasutab
-   API tagastatud märgendatud pilti ja loendusi.
+   API tagastatud märgendatud pilti ja loendusi. Kontrollida mudelivaliku
+   püsimist uue pildi valimisel, kolme taseme linnukese lähtestamist ning seda,
+   et treeningukandidaat märgendatakse valitud mudeliga.
+   Kontrollida, et Oracle'i UTC-ajatemplid kuvatakse brauseri kohalikus
+   ajavööndis.
 7. **JSON-modal.** Avada tulemuse JSON-modal ja kinnitada, et ülejäänud API
    vastus on vormindatult nähtav, kuid `annotated_image.base64` puudub.
    Kinnitada, et märgendatud pilt on samal ajal põhitulemuses nähtav.

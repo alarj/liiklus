@@ -14,7 +14,7 @@ services:
     ports:
       - "127.0.0.1:8010:8000"
     volumes:
-      - ./models/best.onnx:/app/models/best.onnx:ro
+      - ./models:/app/models:ro
       - ${ORACLE_CONFIG_DIR}:/app/oracle-wallet:ro
       - ${TRAINING_POOL_DIR:-/srv/liiklus/training_pool}:${TRAINING_POOL_DIR:-/srv/liiklus/training_pool}
     restart: unless-stopped
@@ -45,7 +45,7 @@ services:
     env_file:
       - .env
     volumes:
-      - ./models/best.onnx:/app/models/best.onnx:ro
+      - ./models:/app/models:ro
     networks:
       - funo_net
 

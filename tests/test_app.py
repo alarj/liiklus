@@ -68,8 +68,10 @@ def _upload(data: bytes, media_type: str, *, size: int | None = None) -> UploadF
 
 
 def _settings() -> traffic_app.Settings:
+    environment_settings = traffic_app.Settings.from_environment()
     return traffic_app.Settings(
-        model_path=traffic_app.Settings.from_environment().model_path,
+        model_dir=environment_settings.model_dir,
+        model_files=environment_settings.model_files,
         ort_intra_op_num_threads=3,
         max_upload_bytes=5 * 1024 * 1024,
         max_image_pixels=10_000_000,
@@ -178,7 +180,9 @@ def test_detection_endpoints_with_synthetic_image(
     data = _encode(image, ".jpg")
     files = {"file": ("blank.jpg", data, "image/jpeg")}
     process_calls = 0
-    original_process = client.app.state.detector.process_bytes
+    default_model = client.app.state.settings.default_model
+    default_detector = client.app.state.detectors[default_model]
+    original_process = default_detector.process_bytes
 
     def counted_process_bytes(
         image_data: bytes,
@@ -190,7 +194,7 @@ def test_detection_endpoints_with_synthetic_image(
         process_calls += 1
         return original_process(image_data, width, height, confidence_threshold)
 
-    monkeypatch.setattr(client.app.state.detector, "process_bytes", counted_process_bytes)
+    monkeypatch.setattr(default_detector, "process_bytes", counted_process_bytes)
 
     json_response = client.post("/api/detect", files=files)
 
@@ -199,6 +203,7 @@ def test_detection_endpoints_with_synthetic_image(
     payload = json_response.json()
     assert payload["filename"] == "blank.jpg"
     assert payload["conf"] == traffic_app.DEFAULT_MODEL_CONFIDENCE
+    assert payload["model"] == default_model
     request_received_at = datetime.fromisoformat(
         payload["request_received_at"].replace("Z", "+00:00")
     )
@@ -218,6 +223,7 @@ def test_detection_endpoints_with_synthetic_image(
     image_payload = image_response.json()
     assert image_payload["filename"] == "blank.jpg"
     assert image_payload["conf"] == 0.25
+    assert image_payload["model"] == default_model
     image_request_received_at = datetime.fromisoformat(
         image_payload["request_received_at"].replace("Z", "+00:00")
     )
@@ -233,3 +239,10 @@ def test_detection_endpoints_with_synthetic_image(
         validate=True,
     )
     assert annotated_jpeg.startswith(b"\xff\xd8")
+
+    invalid_model_response = client.post(
+        "/api/detect?model=missing.onnx",
+        files=files,
+    )
+
+    assert invalid_model_response.status_code == 422

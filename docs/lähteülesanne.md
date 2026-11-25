@@ -2,8 +2,8 @@
 
 ## Dokumendi päritolu
 
-Dokumendi koostas algselt inimene. OpenAI Codex täiendas dokumenti 23. novembril
-2026 kasutajaga kokku lepitud tehniliste otsuste põhjal.
+Dokumendi koostas algselt inimene. OpenAI Codex täiendas dokumenti 23. ja 24.
+novembril 2026 kasutajaga kokku lepitud tehniliste otsuste põhjal.
 
 ## Sisukord
 
@@ -19,14 +19,17 @@ Dokumendi koostas algselt inimene. OpenAI Codex täiendas dokumenti 23. novembri
 - [Tarnitavad failid](#failistruktuur-ja-tarnitavad-failid)
 
 ## Eesmärk
-Luua kerge FastAPI rakendus Ubuntu ARM64 serverile, mis võtab vastu kaamerapildi ja tagastab ONNX-mudeli (`best.onnx`) põhjal tuvastatud sõidukite (auto, buss, tramm) arvud ning koordinaadid.
+Luua kerge FastAPI rakendus Ubuntu ARM64 serverile, mis võtab vastu
+kaamerapildi ja tagastab kasutaja valitud ONNX-mudeli põhjal tuvastatud
+sõidukite (auto, buss, tramm) arvud ning koordinaadid.
 
 ## Tehniline virn
 - **Keel ja raamistik:** Python 3.11+, FastAPI, Uvicorn
 - **Mudeli jooksutamine:** `onnxruntime` (ainult CPU, ilma PyTorchi/Ultralyticsi sõltuvusteta)
 - **Pilditöötlus:** `opencv-python-headless`, `numpy`
 - **UI:** staatiline HTML, eraldi CSS ja vanilla JavaScript eraldi nginx-konteineris
-- **Mudeli fail:** `models/best.onnx`
+- **Mudeli failid:** `.env` muutuja `MODEL_FILES_JSON` järjestatud nimekiri;
+  esimene fail on vaikemudel.
 - **Klassid:** loetakse käivitamisel ONNX-metaandmetest; praeguse mudeli
   järjestus on `0: bus`, `1: car`, `2: tram`.
 
@@ -50,9 +53,10 @@ Luua kerge FastAPI rakendus Ubuntu ARM64 serverile, mis võtab vastu kaamerapild
 
 ## API otspunktid
 1. **`POST /api/detect`**
-   - **Sisend:** `multipart/form-data` (`file`: pildifail), valikuline
-     query-parameeter `conf`. See on mudeli tuvastuse minimaalne
-     usalduslävend ja selle vaikeväärtus on `0.45`.
+   - **Sisend:** `multipart/form-data` (`file`: pildifail), valikulised
+     query-parameetrid `conf` ja `model`. `conf` on mudeli tuvastuse minimaalne
+     usalduslävend vaikeväärtusega `0.45`. `model` on mudelifaili nimi;
+     puudumisel kasutatakse `MODEL_FILES_JSON` esimest mudelit.
    - **Töötlus:** eeltöötlus -> ONNX inferents -> NMS (`iou=0.5`) -> koordinaatide teisendus algse pildi pikslitesse.
    - **Väljund (JSON):**
      ```json
@@ -61,6 +65,8 @@ Luua kerge FastAPI rakendus Ubuntu ARM64 serverile, mis võtab vastu kaamerapild
        "processing_duration_ms": 612.4,
        "filename": "kaamera.jpg",
        "conf": 0.45,
+       "model": "best v2.onnx",
+       "model_sha256": "...",
        "image_size": {"width": 1150, "height": 550},
        "counts": {"bus": 0, "car": 0, "tram": 0},
        "total": 0,
@@ -82,10 +88,14 @@ Luua kerge FastAPI rakendus Ubuntu ARM64 serverile, mis võtab vastu kaamerapild
      kliendi saadetud failinime basename või selle puudumisel `null`. Väli
      `conf` näitab päringus tegelikult kasutatud usalduslävendit, sealhulgas
      `.env` vaikeväärtust, kui query-parameeter puudub.
+   - Väli `model` näitab tegelikult kasutatud mudelifaili ja `model_sha256`
+     selle kontrollsummat.
 3. **`GET /api/health`**
    - Tagastab `{"status": "ok"}`.
 4. **Treeningupildi otspunktid**
-   - `/api/training-pool` haldab kandidaate ja nende algpilte.
+   - `/api/training-pool` haldab kandidaate ja nende algpilte. Kandidaadi
+     eelmärgendus kasutab vormiväljas `model` valitud mudelit või välja
+     puudumisel vaikemudelit.
    - `/api/training-packages` haldab pakke, piltide seoseid ja ZIP-eksporti.
    - Täpne andmemudel on failis [`../db/erd.md`](../db/erd.md).
 
@@ -97,7 +107,8 @@ Luua kerge FastAPI rakendus Ubuntu ARM64 serverile, mis võtab vastu kaamerapild
   kolme operaatorite arvutuslõime. Eraldi Docker CPU-piirangut ei rakendata.
 - Mudeli usalduslävendi vaikeväärtus tuleb `.env` muutujast
   `MODEL_CONFIDENCE_THRESHOLD=0.45`; päringu `conf` võib selle üle kirjutada.
-- Mudelifail ühendatakse konteinerisse read-only mount'ina.
+- Mudelite kataloog ühendatakse konteinerisse read-only mount'ina ja kõik
+  seadistatud mudelid laaditakse API käivitamisel mällu.
 - Kohalik ligipääs on `http://127.0.0.1:8010`.
 - Konteiner ühendatakse olemasolevasse välisesse `funo_net` võrku.
 
@@ -129,11 +140,15 @@ Luua kerge FastAPI rakendus Ubuntu ARM64 serverile, mis võtab vastu kaamerapild
 - UI kuvab tuvastuslävendi seletuses API vaikeväärtuse. Väärtus antakse UI
   konteinerile Compose'i kaudu samast `MODEL_CONFIDENCE_THRESHOLD`
   keskkonnamuutujast ega ole brauseri äriloogikas eraldi määratud.
+- UI kuvab API antud mudelinimekirja dropdown'is samas järjestuses. Mudeli
+  vahetamine eemaldab vana analüüsitulemuse. Uue pildi valimine eemaldab kolme
+  taseme valiku, kuid jätab mudelivaliku alles.
 - Kolme taseme režiimis teeb UI kolm `/api/detect/image` päringut lävenditega
   `default`, `max(0.01, default - 0.20)` ja
   `max(0.01, default - 0.40)` ning kuvab kolm tulemust kõrvuti.
 - UI võimaldab märkida pildi treeningukandidaadiks ning koostada kandidaatidest
-  enne esimest allalaadimist muudetavaid treeningpakke.
+  enne esimest allalaadimist muudetavaid treeningpakke. Eelmärgendus tehakse
+  UI-s valitud mudeliga.
 
 ## Autentimine
 

@@ -73,6 +73,7 @@ function bindEvents() {
   elements.dropZone.addEventListener("dragleave", () => elements.dropZone.classList.remove("is-dragging"));
   elements.dropZone.addEventListener("drop", (event) => { event.preventDefault(); elements.dropZone.classList.remove("is-dragging"); selectFile(event.dataTransfer.files[0]); });
   elements.threeLevelsInput.addEventListener("change", () => { elements.confidenceInput.disabled = elements.threeLevelsInput.checked; });
+  elements.modelSelect.addEventListener("change", () => { clearResults(); clearMessage(elements.requestMessage); });
   elements.candidateButton.addEventListener("click", () => elements.candidateDialog.showModal());
   elements.cancelCandidateButton.addEventListener("click", () => elements.candidateDialog.close());
   elements.candidateForm.addEventListener("submit", saveCandidate);
@@ -159,6 +160,18 @@ async function loadCurrentUser() {
   state.csrfToken = state.user.csrf_token;
   elements.currentUser.textContent = state.user.display_name || state.user.email;
   renderQuickTags(state.user.training_quick_tags || []);
+  renderModels(state.user.models || [], state.user.default_model);
+}
+
+function renderModels(models, defaultModel) {
+  elements.modelSelect.replaceChildren();
+  models.forEach((model) => {
+    const option = document.createElement("option");
+    option.value = model;
+    option.textContent = model;
+    elements.modelSelect.append(option);
+  });
+  elements.modelSelect.value = defaultModel;
 }
 
 async function showLogin() {
@@ -220,6 +233,8 @@ function openFilePicker() { elements.imageInput.click(); }
 
 function selectFile(file) {
   if (!file) return;
+  elements.threeLevelsInput.checked = false;
+  elements.confidenceInput.disabled = false;
   state.selectedFile = file;
   revokePreviewUrl();
   state.previewUrl = URL.createObjectURL(file);
@@ -258,11 +273,13 @@ function singleLevel() {
 
 async function analyzeAtLevel(level) {
   const body = new FormData(); body.append("file", state.selectedFile, state.selectedFile.name);
-  return apiRequest(`/detect/image?conf=${encodeURIComponent(level)}`, { method: "POST", body });
+  const query = new URLSearchParams({ conf: String(level), model: elements.modelSelect.value });
+  return apiRequest(`/detect/image?${query}`, { method: "POST", body });
 }
 
 function renderResults() {
   const comparison = state.results.length > 1;
+  elements.resultModel.textContent = state.results[0]?.model || "—";
   elements.singleResult.classList.toggle("hidden", comparison);
   elements.comparisonTable.classList.toggle("hidden", !comparison);
   elements.differencePanel.classList.toggle("hidden", !comparison);
@@ -290,6 +307,7 @@ function renderSingle(result) {
 
 function renderComparison() {
   const table = document.createElement("table");
+  const caption = table.createCaption(); caption.textContent = `${translate("results.model")}: ${state.results[0]?.model || "—"}`;
   const head = document.createElement("thead");
   head.innerHTML = `<tr><th></th>${state.results.map((result) => `<th>${escapeHtml(translate("results.level", { conf: formatNumber(result.conf, 2) }))}</th>`).join("")}</tr>`;
   table.append(head);
@@ -367,7 +385,7 @@ async function saveCandidate(event) {
   event.preventDefault();
   const selectedTags = [...elements.candidateTags.querySelectorAll("input:checked")].map((input) => input.value);
   const reason = elements.candidateReason.value.trim();
-  const body = new FormData(); body.append("file", state.selectedFile, state.selectedFile.name); body.append("reason", reason); body.append("tags", JSON.stringify(selectedTags));
+  const body = new FormData(); body.append("file", state.selectedFile, state.selectedFile.name); body.append("reason", reason); body.append("tags", JSON.stringify(selectedTags)); body.append("model", elements.modelSelect.value);
   try {
     await apiRequest("/training-pool", { method: "POST", body });
     elements.candidateDialog.close(); elements.candidateForm.reset();
@@ -526,7 +544,7 @@ function safeFilename(value) { return value.replace(/\.[^.]+$/, "").replace(/[<>
 function escapeHtml(value) { const div = document.createElement("div"); div.textContent = String(value); return div.innerHTML; }
 function showMessage(element, message, error = false) { element.textContent = message; element.classList.toggle("error", error); }
 function clearMessage(element) { showMessage(element, "", false); }
-function setSubmitting(value) { const activeHistory = state.results.some((result) => result.training_history?.selections?.some((item) => item.file_available)); elements.analyzeButton.disabled = value || !state.selectedFile; elements.replaceButton.disabled = value; elements.threeLevelsInput.disabled = value; elements.confidenceInput.disabled = value || elements.threeLevelsInput.checked; elements.candidateButton.disabled = value || !state.selectedFile || activeHistory; elements.analyzeButton.textContent = translate(value ? "upload.analyzing" : "upload.analyze"); }
+function setSubmitting(value) { const activeHistory = state.results.some((result) => result.training_history?.selections?.some((item) => item.file_available)); elements.analyzeButton.disabled = value || !state.selectedFile; elements.replaceButton.disabled = value; elements.threeLevelsInput.disabled = value; elements.modelSelect.disabled = value; elements.confidenceInput.disabled = value || elements.threeLevelsInput.checked; elements.candidateButton.disabled = value || !state.selectedFile || activeHistory; elements.analyzeButton.textContent = translate(value ? "upload.analyzing" : "upload.analyze"); }
 function clearResults() { state.results = []; elements.resultsCard.classList.add("hidden"); elements.trainingHistory.classList.add("hidden"); elements.comparisonImages.replaceChildren(); }
 function resetForNewImage() { state.selectedFile = null; elements.imageInput.value = ""; elements.selectionPanel.classList.add("hidden"); elements.dropZone.classList.remove("hidden"); elements.selectionStatus.textContent = translate("upload.empty_status"); elements.analyzeButton.disabled = true; elements.candidateButton.disabled = true; clearResults(); revokePreviewUrl(); }
 function revokePreviewUrl() { if (state.previewUrl) URL.revokeObjectURL(state.previewUrl); state.previewUrl = null; }

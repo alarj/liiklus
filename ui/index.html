@@ -69,15 +69,23 @@
           </div>
 
           <div class="analysis-controls">
-            <div class="field-group">
-              <label for="confidenceInput" data-i18n="upload.confidence_label"></label>
-              <input id="confidenceInput" name="conf" type="number" min="0.01" max="1" step="0.01" inputmode="decimal" data-i18n-placeholder="upload.confidence_placeholder" />
-              <p class="field-help" data-i18n="upload.confidence_help"></p>
+            <div class="analysis-fields">
+              <div class="field-group">
+                <label for="confidenceInput" data-i18n="upload.confidence_label"></label>
+                <input id="confidenceInput" name="conf" type="number" min="0.01" max="1" step="0.01" inputmode="decimal" data-i18n-placeholder="upload.confidence_placeholder" />
+                <p class="field-help" data-i18n="upload.confidence_help"></p>
+              </div>
+              <div class="field-group">
+                <label for="modelSelect" data-i18n="upload.model_label"></label>
+                <select id="modelSelect" name="model"></select>
+              </div>
             </div>
-            <label class="toggle-row" for="threeLevelsInput"><input id="threeLevelsInput" type="checkbox" /><span data-i18n="upload.three_levels"></span></label>
-            <div class="primary-actions">
-              <button id="analyzeButton" type="submit" disabled data-i18n="upload.analyze"></button>
-              <button id="candidateButton" class="secondary-button" type="button" disabled data-i18n="candidate.open"></button>
+            <div class="analysis-submit">
+              <label class="toggle-row" for="threeLevelsInput"><input id="threeLevelsInput" type="checkbox" /><span data-i18n="upload.three_levels"></span></label>
+              <div class="primary-actions">
+                <button id="analyzeButton" type="submit" disabled data-i18n="upload.analyze"></button>
+                <button id="candidateButton" class="secondary-button" type="button" disabled data-i18n="candidate.open"></button>
+              </div>
             </div>
           </div>
         </form>
@@ -111,9 +119,10 @@
         <dl class="metadata-grid">
           <div><dt data-i18n="results.filename"></dt><dd id="resultFilename"></dd></div>
           <div><dt data-i18n="results.image_size"></dt><dd id="resultImageSize"></dd></div>
+          <div><dt data-i18n="results.model"></dt><dd id="resultModel"></dd></div>
           <div><dt data-i18n="results.confidence"></dt><dd id="resultConfidence"></dd></div>
           <div><dt data-i18n="results.processing_time"></dt><dd id="resultDuration"></dd></div>
-          <div class="wide"><dt data-i18n="results.received_at"></dt><dd id="resultReceivedAt"></dd></div>
+          <div><dt data-i18n="results.received_at"></dt><dd id="resultReceivedAt"></dd></div>
         </dl>
 
         <details id="detectionsDetails" class="detections-details">

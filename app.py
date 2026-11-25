@@ -108,6 +108,7 @@ class DetectionResult(DetectionData):
     processing_duration_ms: float
     filename: str | None
     conf: float
+    model: str
     model_sha256: str
     training_history: dict[str, Any] | None = None
 
@@ -135,7 +136,8 @@ class PackageImagesRequest(BaseModel):
 
 @dataclass(frozen=True)
 class Settings:
-    model_path: Path
+    model_dir: Path
+    model_files: tuple[str, ...]
     ort_intra_op_num_threads: int
     max_upload_bytes: int
     max_image_pixels: int
@@ -150,7 +152,8 @@ class Settings:
     @classmethod
     def from_environment(cls) -> Settings:
         return cls(
-            model_path=Path(os.getenv("MODEL_PATH", "/app/models/best.onnx")),
+            model_dir=Path(os.getenv("MODEL_DIR", "/app/models")).resolve(),
+            model_files=_model_files_from_environment(),
             ort_intra_op_num_threads=_positive_int_environment(
                 "ORT_INTRA_OP_NUM_THREADS", 3
             ),
@@ -185,6 +188,10 @@ class Settings:
             google_client_id=os.getenv("GOOGLE_CLIENT_ID", "").strip(),
             session_secret=os.getenv("SESSION_SECRET", "").strip(),
         )
+
+    @property
+    def default_model(self) -> str:
+        return self.model_files[0]
 
 
 @dataclass(frozen=True)
@@ -248,8 +255,23 @@ def _string_list_environment(name: str, default: tuple[str, ...]) -> tuple[str, 
         raise RuntimeError(f"{name} must be a JSON array of strings")
     tags = tuple(dict.fromkeys(item.strip() for item in value if item.strip()))
     if not tags:
-        raise RuntimeError(f"{name} must contain at least one tag")
+        raise RuntimeError(f"{name} must contain at least one value")
     return tags
+
+
+def _model_files_from_environment() -> tuple[str, ...]:
+    model_files = _string_list_environment("MODEL_FILES_JSON", ("best.onnx",))
+    for model_file in model_files:
+        path = Path(model_file)
+        if (
+            path.name != model_file
+            or path.suffix.lower() != ".onnx"
+            or path.is_absolute()
+        ):
+            raise RuntimeError(
+                "MODEL_FILES_JSON entries must be ONNX filenames without paths"
+            )
+    return model_files
 
 
 def _sha256(path: Path) -> str:
@@ -445,9 +467,10 @@ def _class_aware_nms(
 
 
 class Detector:
-    def __init__(self, settings: Settings) -> None:
-        if not settings.model_path.is_file():
-            raise RuntimeError(f"ONNX model not found: {settings.model_path}")
+    def __init__(self, settings: Settings, model_name: str) -> None:
+        model_path = settings.model_dir / model_name
+        if not model_path.is_file():
+            raise RuntimeError(f"ONNX model not found: {model_path}")
 
         session_options = ort.SessionOptions()
         session_options.intra_op_num_threads = settings.ort_intra_op_num_threads
@@ -455,12 +478,13 @@ class Detector:
         session_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
         session_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
         self.session = ort.InferenceSession(
-            str(settings.model_path),
+            str(model_path),
             sess_options=session_options,
             providers=["CPUExecutionProvider"],
         )
         self.settings = settings
-        self.model_sha256 = _sha256(settings.model_path)
+        self.model_name = model_name
+        self.model_sha256 = _sha256(model_path)
         self.class_names = _parse_class_names(
             self.session.get_modelmeta().custom_metadata_map.get("names")
         )
@@ -635,6 +659,7 @@ def _detection_result(
     processing_duration_ms: float,
     filename: str | None,
     confidence_threshold: float,
+    model_name: str,
     model_sha256: str,
     training_history: dict[str, Any] | None,
 ) -> DetectionResult:
@@ -643,6 +668,7 @@ def _detection_result(
         processing_duration_ms=round(processing_duration_ms, 3),
         filename=_safe_filename(filename),
         conf=confidence_threshold,
+        model=model_name,
         model_sha256=model_sha256,
         training_history=training_history,
         image_size=processed.result.image_size,
@@ -661,14 +687,17 @@ async def lifespan(app: FastAPI):
         raise RuntimeError("GOOGLE_CLIENT_ID is required")
     settings.training_pool_dir.mkdir(parents=True, exist_ok=True)
     app.state.settings = settings
-    app.state.detector = Detector(settings)
+    app.state.detectors = {
+        model_name: Detector(settings, model_name)
+        for model_name in settings.model_files
+    }
     app.state.repository = OracleRepository.from_env()
     try:
         yield
     finally:
         app.state.repository.close()
         del app.state.repository
-        del app.state.detector
+        del app.state.detectors
 
 
 app = FastAPI(
@@ -690,8 +719,16 @@ app.add_middleware(
 )
 
 
-def _detector(request: Request) -> Detector:
-    return request.app.state.detector
+def _detector(request: Request, model_name: str | None = None) -> Detector:
+    settings: Settings = request.app.state.settings
+    selected_model = model_name or settings.default_model
+    try:
+        return request.app.state.detectors[selected_model]
+    except KeyError as exc:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            f"Unknown model: {selected_model}",
+        ) from exc
 
 
 def _repository(request: Request) -> OracleRepository:
@@ -789,13 +826,16 @@ async def google_login(body: GoogleAuthRequest, request: Request) -> dict[str, b
 
 @app.get("/api/auth/me")
 def auth_me(request: Request, user: Annotated[User, Depends(current_user)]) -> dict[str, Any]:
+    settings: Settings = request.app.state.settings
     return {
         "public_id": user.public_id,
         "email": user.email,
         "display_name": user.display_name,
         "role": user.role_code,
         "csrf_token": _csrf_token(request),
-        "training_quick_tags": request.app.state.settings.training_quick_tags,
+        "training_quick_tags": settings.training_quick_tags,
+        "models": settings.model_files,
+        "default_model": settings.default_model,
     }
 
 
@@ -810,9 +850,11 @@ def auth_logout(
 
 
 def _detect_upload(
-    request: Request, file: UploadFile, confidence_threshold: float
+    request: Request,
+    detector: Detector,
+    file: UploadFile,
+    confidence_threshold: float,
 ) -> tuple[ProcessedImage, dict[str, Any] | None]:
-    detector = _detector(request)
     data, width, height = _read_upload(file, detector.settings)
     processed = detector.process_bytes(data, width, height, confidence_threshold)
     history = _repository(request).training_history(hashlib.sha256(data).hexdigest())
@@ -829,6 +871,10 @@ def detect(
     response: Response,
     file: Annotated[UploadFile, File(description="JPEG or PNG image")],
     user: Annotated[User, Depends(current_user)],
+    model: Annotated[
+        str | None,
+        Query(description="ONNX model filename; defaults to the first configured model"),
+    ] = None,
     conf: Annotated[
         float,
         Query(
@@ -841,14 +887,15 @@ def detect(
     del user
     request_received_at = datetime.now(timezone.utc)
     processing_started_at = time.perf_counter()
-    detector = _detector(request)
-    processed, history = _detect_upload(request, file, conf)
+    detector = _detector(request, model)
+    processed, history = _detect_upload(request, detector, file, conf)
     result = _detection_result(
         processed,
         request_received_at,
         (time.perf_counter() - processing_started_at) * 1000,
         file.filename,
         conf,
+        detector.model_name,
         detector.model_sha256,
         history,
     )
@@ -866,6 +913,10 @@ def detect_image(
     response: Response,
     file: Annotated[UploadFile, File(description="JPEG or PNG image")],
     user: Annotated[User, Depends(current_user)],
+    model: Annotated[
+        str | None,
+        Query(description="ONNX model filename; defaults to the first configured model"),
+    ] = None,
     conf: Annotated[
         float,
         Query(
@@ -878,8 +929,8 @@ def detect_image(
     del user
     request_received_at = datetime.now(timezone.utc)
     processing_started_at = time.perf_counter()
-    detector = _detector(request)
-    processed, history = _detect_upload(request, file, conf)
+    detector = _detector(request, model)
+    processed, history = _detect_upload(request, detector, file, conf)
     annotated_jpeg = _annotate(processed.original, processed.result.detections)
     result = _detection_result(
         processed,
@@ -887,6 +938,7 @@ def detect_image(
         (time.perf_counter() - processing_started_at) * 1000,
         file.filename,
         conf,
+        detector.model_name,
         detector.model_sha256,
         history,
     )
@@ -973,6 +1025,7 @@ def create_training_candidate(
     file: Annotated[UploadFile, File(description="JPEG or PNG image")],
     reason: Annotated[str, Form(max_length=2000)] = "",
     tags: Annotated[str, Form()] = "[]",
+    model: Annotated[str | None, Form()] = None,
     user: User = Depends(current_user),
 ) -> dict[str, Any]:
     _verify_csrf(request)
@@ -993,7 +1046,7 @@ def create_training_candidate(
             settings,
         )
     )
-    detector = _detector(request)
+    detector = _detector(request, model)
     processed = detector.process_bytes(
         stored_data,
         stored_width,
@@ -1033,6 +1086,8 @@ def create_training_candidate(
                 "tags_json": _parse_tags(tags),
                 "analysis_json": {
                     "conf": settings.training_label_confidence,
+                    "model": detector.model_name,
+                    "model_sha256": detector.model_sha256,
                     "image_size": processed.result.image_size.model_dump(),
                     "counts": processed.result.counts,
                     "total": processed.result.total,

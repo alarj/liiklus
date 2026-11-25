@@ -4,6 +4,7 @@ import os
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Iterator, Sequence
 
 
@@ -46,7 +47,18 @@ def _oracle_kwargs() -> dict[str, str]:
 def _row(cursor: Any, value: Sequence[Any] | None) -> dict[str, Any] | None:
     if value is None:
         return None
-    return {column[0].lower(): item for column, item in zip(cursor.description, value)}
+    return {
+        column[0].lower(): _utc_datetime(item)
+        for column, item in zip(cursor.description, value)
+    }
+
+
+def _utc_datetime(value: Any) -> Any:
+    if not isinstance(value, datetime):
+        return value
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
 
 
 def _rows(cursor: Any) -> list[dict[str, Any]]:
