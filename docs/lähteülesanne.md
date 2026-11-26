@@ -2,8 +2,8 @@
 
 ## Dokumendi päritolu
 
-Dokumendi koostas algselt inimene. OpenAI Codex täiendas dokumenti 23. novembril
-2026 kasutajaga kokku lepitud tehniliste otsuste põhjal.
+Dokumendi koostas algselt inimene. OpenAI Codex täiendas dokumenti 23., 24. ja
+26. novembril 2026 kasutajaga kokku lepitud tehniliste otsuste põhjal.
 
 ## Sisukord
 
@@ -19,14 +19,17 @@ Dokumendi koostas algselt inimene. OpenAI Codex täiendas dokumenti 23. novembri
 - [Tarnitavad failid](#failistruktuur-ja-tarnitavad-failid)
 
 ## Eesmärk
-Luua kerge FastAPI rakendus Ubuntu ARM64 serverile, mis võtab vastu kaamerapildi ja tagastab ONNX-mudeli (`best.onnx`) põhjal tuvastatud sõidukite (auto, buss, tramm) arvud ning koordinaadid.
+Luua kerge FastAPI rakendus Ubuntu ARM64 serverile, mis võtab vastu
+kaamerapildi ja tagastab kasutaja valitud ONNX-mudeli põhjal tuvastatud
+sõidukite (auto, buss, tramm) arvud ning koordinaadid.
 
 ## Tehniline virn
 - **Keel ja raamistik:** Python 3.11+, FastAPI, Uvicorn
 - **Mudeli jooksutamine:** `onnxruntime` (ainult CPU, ilma PyTorchi/Ultralyticsi sõltuvusteta)
 - **Pilditöötlus:** `opencv-python-headless`, `numpy`
 - **UI:** staatiline HTML, eraldi CSS ja vanilla JavaScript eraldi nginx-konteineris
-- **Mudeli fail:** `models/best.onnx`
+- **Mudeli failid:** `.env` muutuja `MODEL_FILES_JSON` järjestatud nimekiri;
+  esimene fail on vaikemudel.
 - **Klassid:** loetakse käivitamisel ONNX-metaandmetest; praeguse mudeli
   järjestus on `0: bus`, `1: car`, `2: tram`.
 
@@ -50,10 +53,22 @@ Luua kerge FastAPI rakendus Ubuntu ARM64 serverile, mis võtab vastu kaamerapild
 
 ## API otspunktid
 1. **`POST /api/detect`**
-   - **Sisend:** `multipart/form-data` (`file`: pildifail), valikuline
-     query-parameeter `conf`. See on mudeli tuvastuse minimaalne
-     usalduslävend ja selle vaikeväärtus on `0.45`.
-   - **Töötlus:** eeltöötlus -> ONNX inferents -> NMS (`iou=0.5`) -> koordinaatide teisendus algse pildi pikslitesse.
+   - **Sisend:** `multipart/form-data` (`file`: pildifail), valikulised
+     query-parameetrid `conf`, `model`, `cross_class_dedup` ja
+     `cross_class_iou_threshold`. `conf` on mudeli tuvastuse minimaalne
+     usalduslävend vaikeväärtusega `0.45`. `model` on mudelifaili nimi;
+     puudumisel kasutatakse `MODEL_FILES_JSON` esimest mudelit.
+     `cross_class_dedup` lubab ainult väärtusi `0` ja `1`; puudumisel kasutatakse
+     `CROSS_CLASS_DEDUP_DEFAULT` väärtust. Lävendit võib päringus anda ainult
+     sisselülitatud filtri korral ning selle puudumisel kasutatakse
+     `CROSS_CLASS_IOU_THRESHOLD` väärtust.
+   - **Töötlus:** eeltöötlus -> ONNX inferents -> sama klassi NMS (`iou=0.5`)
+     -> valikuline klassideülene duplikaadifilter -> koordinaatide teisendus
+     algse pildi pikslitesse. Klassideülene filter töötleb confidence'i järgi
+     kahanevalt esimese NMS-i läbinud kaste ja eemaldab madalama confidence'iga
+     eri klassi kasti, kui kastide standardne IoU on lävendiga võrdne või
+     sellest suurem. Sama klassi kaste ja ainult sisaldumise tõttu kattuvaid
+     objekte see filter ei eemalda.
    - **Väljund (JSON):**
      ```json
      {
@@ -61,6 +76,10 @@ Luua kerge FastAPI rakendus Ubuntu ARM64 serverile, mis võtab vastu kaamerapild
        "processing_duration_ms": 612.4,
        "filename": "kaamera.jpg",
        "conf": 0.45,
+       "model": "best v2.onnx",
+       "model_sha256": "...",
+       "cross_class_dedup": 1,
+       "cross_class_iou_threshold": 0.8,
        "image_size": {"width": 1150, "height": 550},
        "counts": {"bus": 0, "car": 0, "tram": 0},
        "total": 0,
@@ -82,10 +101,19 @@ Luua kerge FastAPI rakendus Ubuntu ARM64 serverile, mis võtab vastu kaamerapild
      kliendi saadetud failinime basename või selle puudumisel `null`. Väli
      `conf` näitab päringus tegelikult kasutatud usalduslävendit, sealhulgas
      `.env` vaikeväärtust, kui query-parameeter puudub.
+   - Väli `model` näitab tegelikult kasutatud mudelifaili ja `model_sha256`
+     selle kontrollsummat.
+   - Väli `cross_class_dedup` näitab tegelikult kasutatud väärtust `0` või `1`.
+     `cross_class_iou_threshold` tagastatakse ainult siis, kui filter oli sees.
 3. **`GET /api/health`**
    - Tagastab `{"status": "ok"}`.
 4. **Treeningupildi otspunktid**
-   - `/api/training-pool` haldab kandidaate ja nende algpilte.
+   - `/api/training-pool` haldab kandidaate ja nende algpilte. Kandidaadi
+     eelmärgendus kasutab vormiväljas `model` valitud mudelit või välja
+     puudumisel vaikemudelit. Vormiväljad `cross_class_dedup` ja
+     `cross_class_iou_threshold` järgivad tuvastusotspunktidega sama lepingut;
+     tegelikult rakendatud väärtused salvestatakse kandidaadi `analysis_json`
+     metaandmetesse. Väljalülitatud filtri korral lävendit ei salvestata.
    - `/api/training-packages` haldab pakke, piltide seoseid ja ZIP-eksporti.
    - Täpne andmemudel on failis [`../db/erd.md`](../db/erd.md).
 
@@ -97,7 +125,12 @@ Luua kerge FastAPI rakendus Ubuntu ARM64 serverile, mis võtab vastu kaamerapild
   kolme operaatorite arvutuslõime. Eraldi Docker CPU-piirangut ei rakendata.
 - Mudeli usalduslävendi vaikeväärtus tuleb `.env` muutujast
   `MODEL_CONFIDENCE_THRESHOLD=0.45`; päringu `conf` võib selle üle kirjutada.
-- Mudelifail ühendatakse konteinerisse read-only mount'ina.
+- Klassideülese duplikaadifiltri vaikeolek ja IoU lävend tulevad kohustuslikest
+  `.env` muutujatest `CROSS_CLASS_DEDUP_DEFAULT` ja
+  `CROSS_CLASS_IOU_THRESHOLD`; päringu parameetrid võivad need konkreetse
+  analüüsi jaoks üle kirjutada.
+- Mudelite kataloog ühendatakse konteinerisse read-only mount'ina ja kõik
+  seadistatud mudelid laaditakse API käivitamisel mällu.
 - Kohalik ligipääs on `http://127.0.0.1:8010`.
 - Konteiner ühendatakse olemasolevasse välisesse `funo_net` võrku.
 
@@ -123,17 +156,36 @@ Luua kerge FastAPI rakendus Ubuntu ARM64 serverile, mis võtab vastu kaamerapild
   tuvastused. API JSON-vastust saab vaadata eraldi modalis; kuvamiseks loodud
   koopiast eemaldatakse lennult `annotated_image.base64`, sest pilt kuvatakse
   eraldi tavavaates. Modali ikoonnupust saab sama JSON-i ilma Base64-väljata
-  `.json` failina alla laadida.
+  `.json` failina alla laadida. Tulemuste all kuvatakse ainult JSON-vaate nupp;
+  uue pildi saab valida lehe ülaosas oleva pildisisendi kaudu.
+- Märgendatud pildi kastijoone paksus, klassiteksti suurus, tekstitaust ja
+  vahed skaleeruvad algpildi mõõdu järgi. Ligikaudu 1152 px laiuse pildi juures
+  kasutatakse baasväärtusi; suure pildi vähendamisel UI-s peab annotatsioon
+  jääma sama hästi loetavaks.
 - UI CSS asub eraldi failis ja kasutab TTÜ-loengu projekti olemasolevat
   kujunduskeelt. Kasutajaliidese tekstid tulevad eestikeelsest tõlkefailist.
 - UI kuvab tuvastuslävendi seletuses API vaikeväärtuse. Väärtus antakse UI
   konteinerile Compose'i kaudu samast `MODEL_CONFIDENCE_THRESHOLD`
   keskkonnamuutujast ega ole brauseri äriloogikas eraldi määratud.
+- UI kuvab API antud mudelinimekirja dropdown'is samas järjestuses. Mudeli
+  vahetamine eemaldab vana analüüsitulemuse. Uue pildi valimine eemaldab kolme
+  taseme valiku, kuid jätab mudelivaliku alles.
+- UI saab klassideülese duplikaadifiltri algoleku ja IoU lävendi API kaudu
+  serveri seadistusest. Väljalülitatud filtri korral lävendivälja ei kuvata ega
+  saadeta. Tulemuste metaandmetes kuvatakse filtri tegelik olek ning lävend
+  ainult siis, kui filter oli sees. JSON-vaates kehtib sama tingimus.
+- Analüüsi ja treeningukandidaadi tegevusnupud paiknevad „Vali pilt“ pealkirjaga
+  samal päisereal ning „Analüüsi pilti“ on kõige parempoolsem nupp. Pildiala all paiknevad kompaktsed
+  tuvastuslävendi ja mudeli väljad, duplikaadifiltri switch, selle järel
+  tingimuslik kompaktne IoU väli ning paremas servas kolme taseme switch.
+  Pildi valiku olekut eraldi sildiga ei dubleerita. Kitsamal ekraanil murtakse
+  juhtelemendid ilma kattumiseta järgmistele ridadele.
 - Kolme taseme režiimis teeb UI kolm `/api/detect/image` päringut lävenditega
   `default`, `max(0.01, default - 0.20)` ja
   `max(0.01, default - 0.40)` ning kuvab kolm tulemust kõrvuti.
 - UI võimaldab märkida pildi treeningukandidaadiks ning koostada kandidaatidest
-  enne esimest allalaadimist muudetavaid treeningpakke.
+  enne esimest allalaadimist muudetavaid treeningpakke. Eelmärgendus tehakse
+  UI-s valitud mudeliga.
 
 ## Autentimine
 

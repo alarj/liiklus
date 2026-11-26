@@ -134,6 +134,7 @@ Registrit tuleb täiendada kohe, kui projektile lisandub README, andmeskeem, API
 - [`db/erd.md`](../db/erd.md) — Oracle'i aktiivõppe andmemudel, tabelid, seosed ja terviklusreeglid.
 - [`db/schema/001_core_schema.sql`](../db/schema/001_core_schema.sql) — Oracle'i skeemi loomise skript.
 - [`tests/test_app.py`](../tests/test_app.py) — automatiseeritud API ja eeltöötluse testid.
+- [`tests/test_ui_contract.py`](../tests/test_ui_contract.py) — UI staatilise lepingu testid.
 - [`requirements-test.txt`](../requirements-test.txt) — testide fikseeritud sõltuvused.
 
 ## 10. Millal mida kindlasti lugeda

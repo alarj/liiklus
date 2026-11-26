@@ -19,7 +19,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 import cv2
 import httpx
@@ -108,7 +108,10 @@ class DetectionResult(DetectionData):
     processing_duration_ms: float
     filename: str | None
     conf: float
+    model: str
     model_sha256: str
+    cross_class_dedup: Literal[0, 1]
+    cross_class_iou_threshold: float | None = None
     training_history: dict[str, Any] | None = None
 
 
@@ -135,8 +138,11 @@ class PackageImagesRequest(BaseModel):
 
 @dataclass(frozen=True)
 class Settings:
-    model_path: Path
+    model_dir: Path
+    model_files: tuple[str, ...]
     ort_intra_op_num_threads: int
+    cross_class_dedup_default: Literal[0, 1]
+    cross_class_iou_threshold: float
     max_upload_bytes: int
     max_image_pixels: int
     training_pool_dir: Path
@@ -150,9 +156,16 @@ class Settings:
     @classmethod
     def from_environment(cls) -> Settings:
         return cls(
-            model_path=Path(os.getenv("MODEL_PATH", "/app/models/best.onnx")),
+            model_dir=Path(os.getenv("MODEL_DIR", "/app/models")).resolve(),
+            model_files=_model_files_from_environment(),
             ort_intra_op_num_threads=_positive_int_environment(
                 "ORT_INTRA_OP_NUM_THREADS", 3
+            ),
+            cross_class_dedup_default=_zero_or_one_environment(
+                "CROSS_CLASS_DEDUP_DEFAULT"
+            ),
+            cross_class_iou_threshold=_required_float_environment(
+                "CROSS_CLASS_IOU_THRESHOLD", minimum=0.01, maximum=1.0
             ),
             max_upload_bytes=_positive_int_environment(
                 "MAX_UPLOAD_BYTES", 5 * 1024 * 1024
@@ -186,6 +199,10 @@ class Settings:
             session_secret=os.getenv("SESSION_SECRET", "").strip(),
         )
 
+    @property
+    def default_model(self) -> str:
+        return self.model_files[0]
+
 
 @dataclass(frozen=True)
 class PreparedImage:
@@ -211,6 +228,28 @@ def _positive_int_environment(name: str, default: int) -> int:
         raise RuntimeError(f"{name} must be an integer") from exc
     if value <= 0:
         raise RuntimeError(f"{name} must be greater than zero")
+    return value
+
+
+def _zero_or_one_environment(name: str) -> Literal[0, 1]:
+    raw_value = os.getenv(name)
+    if raw_value not in {"0", "1"}:
+        raise RuntimeError(f"{name} must be 0 or 1")
+    return 1 if raw_value == "1" else 0
+
+
+def _required_float_environment(
+    name: str, *, minimum: float, maximum: float
+) -> float:
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        raise RuntimeError(f"{name} is required")
+    try:
+        value = float(raw_value)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be a number") from exc
+    if not minimum <= value <= maximum:
+        raise RuntimeError(f"{name} must be between {minimum} and {maximum}")
     return value
 
 
@@ -248,8 +287,23 @@ def _string_list_environment(name: str, default: tuple[str, ...]) -> tuple[str, 
         raise RuntimeError(f"{name} must be a JSON array of strings")
     tags = tuple(dict.fromkeys(item.strip() for item in value if item.strip()))
     if not tags:
-        raise RuntimeError(f"{name} must contain at least one tag")
+        raise RuntimeError(f"{name} must contain at least one value")
     return tags
+
+
+def _model_files_from_environment() -> tuple[str, ...]:
+    model_files = _string_list_environment("MODEL_FILES_JSON", ("best.onnx",))
+    for model_file in model_files:
+        path = Path(model_file)
+        if (
+            path.name != model_file
+            or path.suffix.lower() != ".onnx"
+            or path.is_absolute()
+        ):
+            raise RuntimeError(
+                "MODEL_FILES_JSON entries must be ONNX filenames without paths"
+            )
+    return model_files
 
 
 def _sha256(path: Path) -> str:
@@ -444,10 +498,41 @@ def _class_aware_nms(
     return sorted(kept, key=lambda index: float(confidences[index]), reverse=True)
 
 
+def _cross_class_deduplicate(
+    kept_indices: list[int],
+    boxes: np.ndarray,
+    confidences: np.ndarray,
+    class_ids: np.ndarray,
+    iou_threshold: float,
+) -> list[int]:
+    deduplicated: list[int] = []
+    ordered = sorted(
+        kept_indices,
+        key=lambda index: float(confidences[index]),
+        reverse=True,
+    )
+    for current in ordered:
+        earlier = np.asarray(
+            [
+                index
+                for index in deduplicated
+                if class_ids[index] != class_ids[current]
+            ],
+            dtype=np.int64,
+        )
+        if earlier.size and np.any(
+            _iou(boxes[current], boxes[earlier]) >= iou_threshold
+        ):
+            continue
+        deduplicated.append(current)
+    return deduplicated
+
+
 class Detector:
-    def __init__(self, settings: Settings) -> None:
-        if not settings.model_path.is_file():
-            raise RuntimeError(f"ONNX model not found: {settings.model_path}")
+    def __init__(self, settings: Settings, model_name: str) -> None:
+        model_path = settings.model_dir / model_name
+        if not model_path.is_file():
+            raise RuntimeError(f"ONNX model not found: {model_path}")
 
         session_options = ort.SessionOptions()
         session_options.intra_op_num_threads = settings.ort_intra_op_num_threads
@@ -455,12 +540,13 @@ class Detector:
         session_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
         session_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
         self.session = ort.InferenceSession(
-            str(settings.model_path),
+            str(model_path),
             sess_options=session_options,
             providers=["CPUExecutionProvider"],
         )
         self.settings = settings
-        self.model_sha256 = _sha256(settings.model_path)
+        self.model_name = model_name
+        self.model_sha256 = _sha256(model_path)
         self.class_names = _parse_class_names(
             self.session.get_modelmeta().custom_metadata_map.get("names")
         )
@@ -478,9 +564,20 @@ class Detector:
         if isinstance(shape[0], int) and shape[0] != 1:
             raise RuntimeError("ONNX model batch size must be one")
 
-    def process(self, file: UploadFile, confidence_threshold: float) -> ProcessedImage:
+    def process(
+        self,
+        file: UploadFile,
+        confidence_threshold: float,
+        cross_class_iou_threshold: float | None = None,
+    ) -> ProcessedImage:
         data, width, height = _read_upload(file, self.settings)
-        return self.process_bytes(data, width, height, confidence_threshold)
+        return self.process_bytes(
+            data,
+            width,
+            height,
+            confidence_threshold,
+            cross_class_iou_threshold,
+        )
 
     def process_bytes(
         self,
@@ -488,6 +585,7 @@ class Detector:
         width: int,
         height: int,
         confidence_threshold: float,
+        cross_class_iou_threshold: float | None = None,
     ) -> ProcessedImage:
         prepared = _decode_and_prepare(data, width, height)
         with self._inference_lock:
@@ -495,7 +593,12 @@ class Detector:
                 [self.output.name],
                 {self.input.name: prepared.tensor},
             )[0]
-        detections = self._postprocess(raw_output, prepared, confidence_threshold)
+        detections = self._postprocess(
+            raw_output,
+            prepared,
+            confidence_threshold,
+            cross_class_iou_threshold,
+        )
         counts = {name: 0 for name in self.class_names}
         for detection in detections:
             counts[detection.class_name] += 1
@@ -514,6 +617,7 @@ class Detector:
         raw_output: np.ndarray,
         prepared: PreparedImage,
         confidence_threshold: float,
+        cross_class_iou_threshold: float | None,
     ) -> list[Detection]:
         predictions = np.asarray(raw_output)
         if predictions.ndim == 3 and predictions.shape[0] == 1:
@@ -557,6 +661,14 @@ class Detector:
         boxes[:, [0, 2]] /= scale_x
         boxes[:, [1, 3]] /= scale_y
         kept = _class_aware_nms(boxes, confidences, class_ids)
+        if cross_class_iou_threshold is not None:
+            kept = _cross_class_deduplicate(
+                kept,
+                boxes,
+                confidences,
+                class_ids,
+                cross_class_iou_threshold,
+            )
 
         detections: list[Detection] = []
         for index in kept:
@@ -578,8 +690,19 @@ class Detector:
         return detections
 
 
+def _annotation_scale(image: np.ndarray) -> float:
+    height, width = image.shape[:2]
+    return max(1.0, max(width, height) / MODEL_WIDTH)
+
+
 def _annotate(image: np.ndarray, detections: list[Detection]) -> bytes:
     annotated = image.copy()
+    scale = _annotation_scale(image)
+    box_thickness = max(2, round(2 * scale))
+    font_scale = 0.55 * scale
+    text_thickness = max(1, round(scale))
+    horizontal_padding = max(4, round(4 * scale))
+    vertical_padding = max(3, round(3 * scale))
     colors = {
         "bus": (60, 180, 75),
         "car": (230, 130, 40),
@@ -588,16 +711,28 @@ def _annotate(image: np.ndarray, detections: list[Detection]) -> bytes:
     for detection in detections:
         x1, y1, x2, y2 = detection.bbox_xyxy
         color = colors[detection.class_name]
-        cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
+        cv2.rectangle(
+            annotated,
+            (x1, y1),
+            (x2, y2),
+            color,
+            box_thickness,
+        )
         label = f"{detection.class_name} {detection.confidence:.2f}"
         (text_width, text_height), baseline = cv2.getTextSize(
             label,
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.55,
-            1,
+            font_scale,
+            text_thickness,
         )
-        label_top = max(0, y1 - text_height - baseline - 6)
-        label_right = min(annotated.shape[1], x1 + text_width + 8)
+        label_top = max(
+            0,
+            y1 - text_height - baseline - 2 * vertical_padding,
+        )
+        label_right = min(
+            annotated.shape[1],
+            x1 + text_width + 2 * horizontal_padding,
+        )
         cv2.rectangle(
             annotated,
             (x1, label_top),
@@ -608,11 +743,17 @@ def _annotate(image: np.ndarray, detections: list[Detection]) -> bytes:
         cv2.putText(
             annotated,
             label,
-            (x1 + 4, max(text_height + 2, y1 - baseline - 3)),
+            (
+                x1 + horizontal_padding,
+                max(
+                    text_height + vertical_padding,
+                    y1 - baseline - vertical_padding,
+                ),
+            ),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.55,
+            font_scale,
             (255, 255, 255),
-            1,
+            text_thickness,
             cv2.LINE_AA,
         )
 
@@ -629,13 +770,40 @@ def _safe_filename(filename: str | None) -> str | None:
     return basename or None
 
 
+def _resolve_cross_class_options(
+    settings: Settings,
+    cross_class_dedup: int | None,
+    cross_class_iou_threshold: float | None,
+) -> tuple[Literal[0, 1], float | None]:
+    enabled = (
+        settings.cross_class_dedup_default
+        if cross_class_dedup is None
+        else cross_class_dedup
+    )
+    if enabled == 0:
+        if cross_class_iou_threshold is not None:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                "cross_class_iou_threshold is only allowed when cross_class_dedup is 1",
+            )
+        return 0, None
+    return 1, (
+        settings.cross_class_iou_threshold
+        if cross_class_iou_threshold is None
+        else cross_class_iou_threshold
+    )
+
+
 def _detection_result(
     processed: ProcessedImage,
     request_received_at: datetime,
     processing_duration_ms: float,
     filename: str | None,
     confidence_threshold: float,
+    model_name: str,
     model_sha256: str,
+    cross_class_dedup: Literal[0, 1],
+    cross_class_iou_threshold: float | None,
     training_history: dict[str, Any] | None,
 ) -> DetectionResult:
     return DetectionResult(
@@ -643,7 +811,10 @@ def _detection_result(
         processing_duration_ms=round(processing_duration_ms, 3),
         filename=_safe_filename(filename),
         conf=confidence_threshold,
+        model=model_name,
         model_sha256=model_sha256,
+        cross_class_dedup=cross_class_dedup,
+        cross_class_iou_threshold=cross_class_iou_threshold,
         training_history=training_history,
         image_size=processed.result.image_size,
         counts=processed.result.counts,
@@ -661,14 +832,17 @@ async def lifespan(app: FastAPI):
         raise RuntimeError("GOOGLE_CLIENT_ID is required")
     settings.training_pool_dir.mkdir(parents=True, exist_ok=True)
     app.state.settings = settings
-    app.state.detector = Detector(settings)
+    app.state.detectors = {
+        model_name: Detector(settings, model_name)
+        for model_name in settings.model_files
+    }
     app.state.repository = OracleRepository.from_env()
     try:
         yield
     finally:
         app.state.repository.close()
         del app.state.repository
-        del app.state.detector
+        del app.state.detectors
 
 
 app = FastAPI(
@@ -690,8 +864,16 @@ app.add_middleware(
 )
 
 
-def _detector(request: Request) -> Detector:
-    return request.app.state.detector
+def _detector(request: Request, model_name: str | None = None) -> Detector:
+    settings: Settings = request.app.state.settings
+    selected_model = model_name or settings.default_model
+    try:
+        return request.app.state.detectors[selected_model]
+    except KeyError as exc:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            f"Unknown model: {selected_model}",
+        ) from exc
 
 
 def _repository(request: Request) -> OracleRepository:
@@ -789,13 +971,18 @@ async def google_login(body: GoogleAuthRequest, request: Request) -> dict[str, b
 
 @app.get("/api/auth/me")
 def auth_me(request: Request, user: Annotated[User, Depends(current_user)]) -> dict[str, Any]:
+    settings: Settings = request.app.state.settings
     return {
         "public_id": user.public_id,
         "email": user.email,
         "display_name": user.display_name,
         "role": user.role_code,
         "csrf_token": _csrf_token(request),
-        "training_quick_tags": request.app.state.settings.training_quick_tags,
+        "training_quick_tags": settings.training_quick_tags,
+        "models": settings.model_files,
+        "default_model": settings.default_model,
+        "cross_class_dedup_default": settings.cross_class_dedup_default,
+        "cross_class_iou_threshold_default": settings.cross_class_iou_threshold,
     }
 
 
@@ -810,11 +997,20 @@ def auth_logout(
 
 
 def _detect_upload(
-    request: Request, file: UploadFile, confidence_threshold: float
+    request: Request,
+    detector: Detector,
+    file: UploadFile,
+    confidence_threshold: float,
+    cross_class_iou_threshold: float | None,
 ) -> tuple[ProcessedImage, dict[str, Any] | None]:
-    detector = _detector(request)
     data, width, height = _read_upload(file, detector.settings)
-    processed = detector.process_bytes(data, width, height, confidence_threshold)
+    processed = detector.process_bytes(
+        data,
+        width,
+        height,
+        confidence_threshold,
+        cross_class_iou_threshold,
+    )
     history = _repository(request).training_history(hashlib.sha256(data).hexdigest())
     return processed, history
 
@@ -829,6 +1025,10 @@ def detect(
     response: Response,
     file: Annotated[UploadFile, File(description="JPEG or PNG image")],
     user: Annotated[User, Depends(current_user)],
+    model: Annotated[
+        str | None,
+        Query(description="ONNX model filename; defaults to the first configured model"),
+    ] = None,
     conf: Annotated[
         float,
         Query(
@@ -837,19 +1037,49 @@ def detect(
             description="Minimum model confidence required for a detection",
         ),
     ] = DEFAULT_MODEL_CONFIDENCE,
+    cross_class_dedup: Annotated[
+        int | None,
+        Query(
+            ge=0,
+            le=1,
+            description="Enable cross-class duplicate filtering: 1 or 0",
+        ),
+    ] = None,
+    cross_class_iou_threshold: Annotated[
+        float | None,
+        Query(
+            ge=0.01,
+            le=1.0,
+            description="Cross-class IoU threshold; only allowed when filtering is enabled",
+        ),
+    ] = None,
 ) -> DetectionResult:
     del user
     request_received_at = datetime.now(timezone.utc)
     processing_started_at = time.perf_counter()
-    detector = _detector(request)
-    processed, history = _detect_upload(request, file, conf)
+    detector = _detector(request, model)
+    effective_dedup, effective_cross_class_iou = _resolve_cross_class_options(
+        request.app.state.settings,
+        cross_class_dedup,
+        cross_class_iou_threshold,
+    )
+    processed, history = _detect_upload(
+        request,
+        detector,
+        file,
+        conf,
+        effective_cross_class_iou,
+    )
     result = _detection_result(
         processed,
         request_received_at,
         (time.perf_counter() - processing_started_at) * 1000,
         file.filename,
         conf,
+        detector.model_name,
         detector.model_sha256,
+        effective_dedup,
+        effective_cross_class_iou,
         history,
     )
     response.headers["X-Model-SHA256"] = detector.model_sha256
@@ -866,6 +1096,10 @@ def detect_image(
     response: Response,
     file: Annotated[UploadFile, File(description="JPEG or PNG image")],
     user: Annotated[User, Depends(current_user)],
+    model: Annotated[
+        str | None,
+        Query(description="ONNX model filename; defaults to the first configured model"),
+    ] = None,
     conf: Annotated[
         float,
         Query(
@@ -874,12 +1108,39 @@ def detect_image(
             description="Minimum model confidence required for a detection",
         ),
     ] = DEFAULT_MODEL_CONFIDENCE,
+    cross_class_dedup: Annotated[
+        int | None,
+        Query(
+            ge=0,
+            le=1,
+            description="Enable cross-class duplicate filtering: 1 or 0",
+        ),
+    ] = None,
+    cross_class_iou_threshold: Annotated[
+        float | None,
+        Query(
+            ge=0.01,
+            le=1.0,
+            description="Cross-class IoU threshold; only allowed when filtering is enabled",
+        ),
+    ] = None,
 ) -> DetectionImageResult:
     del user
     request_received_at = datetime.now(timezone.utc)
     processing_started_at = time.perf_counter()
-    detector = _detector(request)
-    processed, history = _detect_upload(request, file, conf)
+    detector = _detector(request, model)
+    effective_dedup, effective_cross_class_iou = _resolve_cross_class_options(
+        request.app.state.settings,
+        cross_class_dedup,
+        cross_class_iou_threshold,
+    )
+    processed, history = _detect_upload(
+        request,
+        detector,
+        file,
+        conf,
+        effective_cross_class_iou,
+    )
     annotated_jpeg = _annotate(processed.original, processed.result.detections)
     result = _detection_result(
         processed,
@@ -887,7 +1148,10 @@ def detect_image(
         (time.perf_counter() - processing_started_at) * 1000,
         file.filename,
         conf,
+        detector.model_name,
         detector.model_sha256,
+        effective_dedup,
+        effective_cross_class_iou,
         history,
     )
     response.headers["X-Model-SHA256"] = detector.model_sha256
@@ -973,6 +1237,12 @@ def create_training_candidate(
     file: Annotated[UploadFile, File(description="JPEG or PNG image")],
     reason: Annotated[str, Form(max_length=2000)] = "",
     tags: Annotated[str, Form()] = "[]",
+    model: Annotated[str | None, Form()] = None,
+    cross_class_dedup: Annotated[int | None, Form(ge=0, le=1)] = None,
+    cross_class_iou_threshold: Annotated[
+        float | None,
+        Form(ge=0.01, le=1.0),
+    ] = None,
     user: User = Depends(current_user),
 ) -> dict[str, Any]:
     _verify_csrf(request)
@@ -993,12 +1263,18 @@ def create_training_candidate(
             settings,
         )
     )
-    detector = _detector(request)
+    detector = _detector(request, model)
+    effective_dedup, effective_cross_class_iou = _resolve_cross_class_options(
+        settings,
+        cross_class_dedup,
+        cross_class_iou_threshold,
+    )
     processed = detector.process_bytes(
         stored_data,
         stored_width,
         stored_height,
         settings.training_label_confidence,
+        effective_cross_class_iou,
     )
     public_id = str(uuid.uuid4())
     image_relative_path = _training_filename(public_id, original_filename, extension)
@@ -1033,6 +1309,14 @@ def create_training_candidate(
                 "tags_json": _parse_tags(tags),
                 "analysis_json": {
                     "conf": settings.training_label_confidence,
+                    "model": detector.model_name,
+                    "model_sha256": detector.model_sha256,
+                    "cross_class_dedup": effective_dedup,
+                    **(
+                        {"cross_class_iou_threshold": effective_cross_class_iou}
+                        if effective_cross_class_iou is not None
+                        else {}
+                    ),
                     "image_size": processed.result.image_size.model_dump(),
                     "counts": processed.result.counts,
                     "total": processed.result.total,

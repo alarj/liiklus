@@ -2,8 +2,9 @@
 
 ## 1. Dokumendi päritolu
 
-Dokumendi koostas OpenAI Codex 23. novembril 2026 kasutaja nõudel. Testiplaan
-on teadlikult minimaalne ja vajab enne käivitamist kasutaja heakskiitu.
+Dokumendi koostas OpenAI Codex 23. novembril 2026 kasutaja nõudel ja täiendas
+26. novembril 2026 klassideülese duplikaadifiltri kontrollidega. Testiplaan on
+teadlikult minimaalne ja vajab enne käivitamist kasutaja heakskiitu.
 
 ## 2. Sisukord
 
@@ -41,28 +42,51 @@ nginx-liidestuse ja avalike HTTP-vastuste kontrollid.
    10 000 000 piksliga pilt lükatakse tagasi.
 3. **Pärispildi JSON.** Saata kasutaja antud JPEG- või PNG-pilt otspunktile
    `POST /api/detect`; kontrollida UTC ajatemplit, töötluskestust, failinime,
-   tegelikult kasutatud `conf` väärtust, klassinimesid, koordinaate ja
-   `X-Model-SHA256` päist.
+   tegelikult kasutatud `conf` ja `model` väärtust, klassinimesid, koordinaate,
+   `model_sha256` välja ja `X-Model-SHA256` päist. Kontrollida vaikemudelit,
+   teise lubatud mudeli valikut ja tundmatu mudeli tagasilükkamist.
 4. **Pärispildi visualiseering.** Saata sama pilt otspunktile
    `POST /api/detect/image`; kontrollida, et vastus sisaldab sama tuvastuse
    JSON-i ning `annotated_image.base64` dekodeerub avatavaks JPEG-iks, mille
    kastid vastavad vastuse tuvastustele. Kontrollida, et päringu jooksul
-   tehakse ainult üks mudeli inferents.
-5. **UI staatilised kontrollid.** Kontrollida HTML-i, CSS-i, JavaScripti,
+   tehakse ainult üks mudeli inferents. Võrrelda ligikaudu 1152 px ja 4000 px
+   laiust pilti ning kontrollida, et UI-s vähendatud pildil säilivad kastide ja
+   klassitekstide võrreldav loetavus.
+5. **Klassideülene duplikaadifilter.** Kontrollida, et peaaegu identsest eri
+   klassi kastipaarist jääb alles kõrgema confidence'iga kast, madala IoU-ga
+   eri klassi kastid ja sama klassi kastid jäävad alles ning täpselt lävendiga
+   võrdne kattuvus eemaldatakse. Kontrollida filtri välja lülitamist, `.env`
+   vaikeväärtusi, ainult `0` ja `1` lubavat API sisendit, lävendi tingimuslikku
+   sisendit ja väljundit ning sama lepingu kasutamist treeningukandidaadil.
+6. **UI staatilised kontrollid.** Kontrollida HTML-i, CSS-i, JavaScripti,
    eestikeelse tõlkefaili ja UI nginx-konfiguratsiooni süntaksit ning kinnitada,
-   et UI Docker image ehitub eraldi `liiklus-ui` konteineriks.
-6. **UI põhitöövoog.** Avada UI laua- ja mobiilivaates, valida ning lohistada
+   et UI Docker image ehitub eraldi `liiklus-ui` konteineriks. Kontrollida, et
+   duplikaadifiltri lüliti ja tingimuslik lävendiväli on olemas ning mõlemad
+   väärtused edastatakse analüüsi- ja treeningukandidaadi päringutesse.
+7. **UI põhitöövoog.** Avada UI laua- ja mobiilivaates, valida ning lohistada
    pilt, teha päring API vaike-lävendiga ja kasutaja antud lävendiga ning
    kontrollida laadimis-, vea- ja tulemusolekuid. Kinnitada, et tulemus kasutab
-   API tagastatud märgendatud pilti ja loendusi.
-7. **JSON-modal.** Avada tulemuse JSON-modal ja kinnitada, et ülejäänud API
+   API tagastatud märgendatud pilti ja loendusi. Kontrollida mudelivaliku
+   püsimist uue pildi valimisel, kolme taseme linnukese lähtestamist ning seda,
+   et treeningukandidaat märgendatakse valitud mudeliga.
+   Kontrollida, et Oracle'i UTC-ajatemplid kuvatakse brauseri kohalikus
+   ajavööndis. Kontrollida, et väljalülitatud duplikaadifilter peidab lävendi
+   sisendi ja tulemuste lävendi rea, sisselülitatud filter kuvab mõlemad ning
+   tulemuste leht kasutab API vastuses tagastatud väärtusi. Kontrollida, et
+   analüüsi väljad, lülitid ja tegevusnupud ei kattu laua-, kitsas- ega
+   mobiilivaates. Kontrollida switch'ide klaviatuurifookust ja oleku muutumist,
+   tegevusnuppude paiknemist pildiala kohal ning IoU välja ilmumist vahetult
+   duplikaadifiltri switch'i järel.
+8. **JSON-modal.** Avada tulemuse JSON-modal ja kinnitada, et ülejäänud API
    vastus on vormindatult nähtav, kuid `annotated_image.base64` puudub.
    Kinnitada, et märgendatud pilt on samal ajal põhitulemuses nähtav.
-8. **Proxy ja avalik health.** Kontrollida, et avalik nginx suunab `/` UI-le,
+9. **Proxy ja avalik health.** Kontrollida, et avalik nginx suunab `/` UI-le,
    `/api/` API-le ning `GET /api/health` jääb avalikult kättesaadavaks.
 
-Automatiseeritud testid katavad punktid 1 ja 2 ning punktide 3 ja 4 API lepingu
-sünteetilise pildiga. Punktid 5–8 kontrollivad UI-d ja selle liidestust.
+Automatiseeritud testid katavad punktid 1 ja 2, punktide 3 ja 4 API lepingu
+sünteetilise pildiga ning punkti 5 järeltöötluse ja API lepingu. Staatilised
+UI-testid katavad punkti 6 struktuuri ja päringuparameetrid. Punktid 7–9
+kontrollivad UI-d ja selle liidestust.
 Pärispildi sisuline tulemus kontrollitakse eraldi pärast kasutajalt testpildi
 saamist.
 
@@ -80,6 +104,42 @@ Pärast loa saamist märgitakse iga kontrolli juurde kuupäev, kasutatud sisend,
 tulemus ja võimalik kõrvalekalle. Pärispilte Git-i ega andmebaasi ei lisata.
 
 ## 8. Käivitatud kontrollid
+
+### 26. november 2026 — klassideülene duplikaadifilter
+
+- Esimene käsk `docker compose --profile testing run --rm testing` kasutas
+  varasemat test-image'it ja käivitas ainult seitse vana testi; kõik seitse
+  läbisid kontrolli.
+- Värske koodi kontrollimiseks käivitati
+  `docker compose --profile testing run --build --rm testing`.
+- Kõik 14 testi läbisid kontrolli 2,03 sekundiga. Need hõlmasid
+  klassideülese filtri järeltöötlust, API vaike- ja valideerimisreegleid ning
+  UI staatilist lepingut.
+- Testiväljundis oli kolm deprekatsioonihoiatust: üks FastAPI TestClienti
+  `httpx` integratsiooni kohta ja kaks Starlette'i HTTP 422 konstandi kohta.
+  Hoiatused ei põhjustanud testide ebaõnnestumist.
+
+### 26. november 2026 — duplikaadifilter pärispildiga
+
+- Sisend: kasutaja antud `IMG_20261126_102055.jpg`, `4000 × 2250`.
+- Sisendi SHA-256:
+  `9f23b70273fd8aded3bfecda50d641d0c0bceda1e3dc89411131f3b1de0d9165`.
+- Mudel: `best v3.onnx`; confidence'i lävend `0.45`; klassideülese filtri
+  IoU lävend `0.80`.
+- Väljalülitatud filtriga tuvastati üks buss, üks auto ja kaks trammi.
+- Sisselülitatud filtriga tuvastati null bussi, üks auto ja kaks trammi.
+- Eemaldatud bussikast `[878, 826, 1510, 1126]` confidence'iga `0.692708`
+  kattus trammikastiga `[876, 816, 1509, 1131]` confidence'iga `0.776678`;
+  kastide standardne IoU oli ligikaudu `0.948`. Filter eemaldas madalama
+  confidence'iga bussituvastuse ootuspäraselt.
+
+### 26. november 2026 — API ja UI konteinerite uuendamine
+
+- `liiklus-api` ja `liiklus-ui` image'id ehitati uuesti ning konteinerid loodi
+  värske koodiga uuesti.
+- Mõlemad konteinerid käivitusid olekus `Up`.
+- API kohalik `GET /api/health` vastas `{"status":"ok"}` ja UI konteineri
+  `GET /health` vastas `ok`.
 
 ### 23. november 2026 — UI ehitus ja juurutus
 

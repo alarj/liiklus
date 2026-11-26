@@ -3,7 +3,8 @@
 ## 1. Dokumendi päritolu
 
 Dokumendi koostas OpenAI Codex 23. novembril 2026 kasutaja lähteülesande ja
-tehniliste otsuste põhjal.
+tehniliste otsuste põhjal ning täiendas 24. novembril 2026 mitme mudeli toe
+kirjeldusega.
 
 ## 2. Sisukord
 
@@ -42,15 +43,13 @@ Otspunktid:
 
 - Docker koos Compose'i toega.
 - Olemasolev väline Docker-võrk `funo_net`.
-- Mudelifail `models/best.onnx`; mudelifaile Git-is ei hoita.
+- Mudelifailid `models/best v2.onnx` ja `models/best.onnx`; mudelifaile Git-is
+  ei hoita.
 - Oracle'i skeem on loodud skriptiga `db/schema/001_core_schema.sql`.
 - `TRAINING_POOL_DIR` kataloog on API konteineri kasutajale kirjutatav.
 
-Mudeli praegune SHA-256 kontrollsumma on:
-
-```text
-9675b647b2a7e27480a08e97574eb76a04bb0e3af74fa5de8de0cf782f8cc3cb
-```
+Kasutatava mudeli failinimi ja SHA-256 kontrollsumma tagastatakse iga
+tuvastuspäringu vastuses.
 
 ## 5. Seadistus ja käivitamine
 
@@ -89,26 +88,40 @@ on OpenAPI vaates `/api/docs`.
 
 Mõlemad tuvastusotspunktid tagastavad UTC-välja `request_received_at`,
 millisekundites `processing_duration_ms`, kliendi antud failinime `filename`,
-tegelikult kasutatud usalduslävendi `conf`, pildi mõõdud, klasside loendused ja
-tuvastused. `/api/detect/image` lisab
+tegelikult kasutatud usalduslävendi `conf`, mudeli failinime `model`, mudeli
+kontrollsumma `model_sha256`, pildi mõõdud, klasside loendused ja tuvastused.
+Valikuline query-parameeter `model` valib mudeli failinime järgi; parameetri
+puudumisel kasutatakse `MODEL_FILES_JSON` esimest mudelit.
+`/api/detect/image` lisab
 objekti `annotated_image`, mille `media_type` on `image/jpeg` ja `base64`
 sisaldab märgendatud JPEG-i. Sisendpilt saadetakse mõlemale otspunktile
 tavalise `multipart/form-data` failina, mitte Base64-kujul. Ühe päringu jooksul
 käivitatakse mudel üks kord.
 
+Oracle'is on ajatemplite autoriteetne ajavöönd UTC. API märgib kõik Oracle'ist
+loetud ajatemplid JSON-is UTC-na (`+00:00`); UI teisendab need brauseri
+kohalikku ajavööndisse.
+
 ## 7. UI kasutamine
 
-UI võimaldab analüüsida pilti ühe lävendiga või kolme `.env` vaikeväärtusest
-tuletatud lävendiga. Kolme taseme tulemused kuvatakse kõrvuti.
+UI võimaldab valida `.env` järjestatud nimekirjast mudeli ning analüüsida pilti
+ühe lävendiga või kolme `.env` vaikeväärtusest tuletatud lävendiga. Kolme
+taseme tulemused kuvatakse kõrvuti ja kasutavad sama valitud mudelit.
 
 UI nimetab parameetrit tuvastuslävendiks ja kuvab selgituses API
 vaikeväärtuse. `liiklus-ui` konteiner saab väärtuse Compose'i kaudu samast
 `MODEL_CONFIDENCE_THRESHOLD` keskkonnamuutujast; brauser ei otsusta ise API
 vaikeväärtust.
 
+Uue pildi valimine eemaldab kolme taseme valiku, kuid säilitab kasutaja valitud
+mudeli. Treeningukandidaadi eelmärgendus kasutab samuti kasutaja valitud mudelit.
+Üksiktulemuses kuvatakse kasutatud mudel failinime ja muude metaandmete juures;
+kolme taseme vaates kuvatakse see võrdlustabeli pealkirjas.
+
 Treeninguvaates saab kandidaate otsida, kustutada, lisada unikaalse nimega
 pakki ning paki Roboflow jaoks ZIP-ina alla laadida. Esimene allalaadimine
-lukustab paki koosseisu.
+lukustab paki koosseisu. Kitsal ekraanil paigutuvad treeninguvaate filtrid,
+pakivalikud ja tegevusnupud üksteise alla.
 
 ## 8. Sisendi piirangud
 
@@ -123,8 +136,9 @@ Tavalist tuvastuspilti ei säilitata. Kinnitatud treeningukandidaadi kastideta
 pilt ja YOLO `.txt` salvestatakse `TRAINING_POOL_DIR` kataloogi; metadata ja
 analüüsi JSON salvestatakse Oracle'isse.
 
-Mudelifail ühendatakse konteinerisse kirjutuskaitstud failina:
-`./models/best.onnx:/app/models/best.onnx:ro`.
+Mudelite kataloog ühendatakse konteinerisse kirjutuskaitstult:
+`./models:/app/models:ro`. Kõik `MODEL_FILES_JSON` nimekirjas olevad mudelid
+laaditakse API käivitamisel mällu.
 
 ## 10. Autentimine
 
@@ -136,7 +150,8 @@ sessiooniküpsist. `GET /api/health` jääb avalikuks.
 
 | Muutuja | Vaikeväärtus | Tähendus |
 | --- | ---: | --- |
-| `MODEL_PATH` | `/app/models/best.onnx` | ONNX-mudeli asukoht konteineris |
+| `MODEL_DIR` | `/app/models` | ONNX-mudelite kataloog konteineris |
+| `MODEL_FILES_JSON` | `["best v2.onnx","best.onnx"]` | Lubatud mudelifailid soovitud järjestuses; esimene on vaikemudel |
 | `ORT_INTRA_OP_NUM_THREADS` | `3` | ONNX Runtime'i operaatorite arvutuslõimed |
 | `MODEL_CONFIDENCE_THRESHOLD` | `0.45` | Mudeli usalduslävendi vaikeväärtus |
 | `MAX_UPLOAD_BYTES` | `5242880` | Pildifaili maksimaalne suurus baitides |
