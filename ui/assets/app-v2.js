@@ -82,7 +82,6 @@ function bindEvents() {
   elements.viewJsonButton.addEventListener("click", openJsonDialog);
   elements.downloadJsonButton.addEventListener("click", downloadJson);
   elements.closeJsonButton.addEventListener("click", () => elements.jsonDialog.close());
-  elements.newImageButton.addEventListener("click", resetForNewImage);
   elements.closeImageButton.addEventListener("click", () => elements.imageDialog.close());
   elements.logoutButton.addEventListener("click", logout);
   elements.analysisTab.addEventListener("click", () => switchView("analysis"));
@@ -581,6 +580,5 @@ function showMessage(element, message, error = false) { element.textContent = me
 function clearMessage(element) { showMessage(element, "", false); }
 function setSubmitting(value) { const activeHistory = state.results.some((result) => result.training_history?.selections?.some((item) => item.file_available)); elements.analyzeButton.disabled = value || !state.selectedFile; elements.replaceButton.disabled = value; elements.threeLevelsInput.disabled = value; elements.crossClassDedupInput.disabled = value; elements.crossClassIouInput.disabled = value || !elements.crossClassDedupInput.checked; elements.modelSelect.disabled = value; elements.confidenceInput.disabled = value || elements.threeLevelsInput.checked; elements.candidateButton.disabled = value || !state.selectedFile || activeHistory; elements.analyzeButton.textContent = translate(value ? "upload.analyzing" : "upload.analyze"); }
 function clearResults() { state.results = []; elements.resultsCard.classList.add("hidden"); elements.trainingHistory.classList.add("hidden"); elements.comparisonImages.replaceChildren(); }
-function resetForNewImage() { state.selectedFile = null; elements.imageInput.value = ""; elements.selectionPanel.classList.add("hidden"); elements.dropZone.classList.remove("hidden"); elements.analyzeButton.disabled = true; elements.candidateButton.disabled = true; clearResults(); revokePreviewUrl(); }
 function revokePreviewUrl() { if (state.previewUrl) URL.revokeObjectURL(state.previewUrl); state.previewUrl = null; }
 

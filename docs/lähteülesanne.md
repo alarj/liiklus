@@ -156,7 +156,12 @@ sõidukite (auto, buss, tramm) arvud ning koordinaadid.
   tuvastused. API JSON-vastust saab vaadata eraldi modalis; kuvamiseks loodud
   koopiast eemaldatakse lennult `annotated_image.base64`, sest pilt kuvatakse
   eraldi tavavaates. Modali ikoonnupust saab sama JSON-i ilma Base64-väljata
-  `.json` failina alla laadida.
+  `.json` failina alla laadida. Tulemuste all kuvatakse ainult JSON-vaate nupp;
+  uue pildi saab valida lehe ülaosas oleva pildisisendi kaudu.
+- Märgendatud pildi kastijoone paksus, klassiteksti suurus, tekstitaust ja
+  vahed skaleeruvad algpildi mõõdu järgi. Ligikaudu 1152 px laiuse pildi juures
+  kasutatakse baasväärtusi; suure pildi vähendamisel UI-s peab annotatsioon
+  jääma sama hästi loetavaks.
 - UI CSS asub eraldi failis ja kasutab TTÜ-loengu projekti olemasolevat
   kujunduskeelt. Kasutajaliidese tekstid tulevad eestikeelsest tõlkefailist.
 - UI kuvab tuvastuslävendi seletuses API vaikeväärtuse. Väärtus antakse UI

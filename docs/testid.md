@@ -49,7 +49,9 @@ nginx-liidestuse ja avalike HTTP-vastuste kontrollid.
    `POST /api/detect/image`; kontrollida, et vastus sisaldab sama tuvastuse
    JSON-i ning `annotated_image.base64` dekodeerub avatavaks JPEG-iks, mille
    kastid vastavad vastuse tuvastustele. Kontrollida, et päringu jooksul
-   tehakse ainult üks mudeli inferents.
+   tehakse ainult üks mudeli inferents. Võrrelda ligikaudu 1152 px ja 4000 px
+   laiust pilti ning kontrollida, et UI-s vähendatud pildil säilivad kastide ja
+   klassitekstide võrreldav loetavus.
 5. **Klassideülene duplikaadifilter.** Kontrollida, et peaaegu identsest eri
    klassi kastipaarist jääb alles kõrgema confidence'iga kast, madala IoU-ga
    eri klassi kastid ja sama klassi kastid jäävad alles ning täpselt lävendiga

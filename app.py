@@ -690,8 +690,19 @@ class Detector:
         return detections
 
 
+def _annotation_scale(image: np.ndarray) -> float:
+    height, width = image.shape[:2]
+    return max(1.0, max(width, height) / MODEL_WIDTH)
+
+
 def _annotate(image: np.ndarray, detections: list[Detection]) -> bytes:
     annotated = image.copy()
+    scale = _annotation_scale(image)
+    box_thickness = max(2, round(2 * scale))
+    font_scale = 0.55 * scale
+    text_thickness = max(1, round(scale))
+    horizontal_padding = max(4, round(4 * scale))
+    vertical_padding = max(3, round(3 * scale))
     colors = {
         "bus": (60, 180, 75),
         "car": (230, 130, 40),
@@ -700,16 +711,28 @@ def _annotate(image: np.ndarray, detections: list[Detection]) -> bytes:
     for detection in detections:
         x1, y1, x2, y2 = detection.bbox_xyxy
         color = colors[detection.class_name]
-        cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
+        cv2.rectangle(
+            annotated,
+            (x1, y1),
+            (x2, y2),
+            color,
+            box_thickness,
+        )
         label = f"{detection.class_name} {detection.confidence:.2f}"
         (text_width, text_height), baseline = cv2.getTextSize(
             label,
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.55,
-            1,
+            font_scale,
+            text_thickness,
         )
-        label_top = max(0, y1 - text_height - baseline - 6)
-        label_right = min(annotated.shape[1], x1 + text_width + 8)
+        label_top = max(
+            0,
+            y1 - text_height - baseline - 2 * vertical_padding,
+        )
+        label_right = min(
+            annotated.shape[1],
+            x1 + text_width + 2 * horizontal_padding,
+        )
         cv2.rectangle(
             annotated,
             (x1, label_top),
@@ -720,11 +743,17 @@ def _annotate(image: np.ndarray, detections: list[Detection]) -> bytes:
         cv2.putText(
             annotated,
             label,
-            (x1 + 4, max(text_height + 2, y1 - baseline - 3)),
+            (
+                x1 + horizontal_padding,
+                max(
+                    text_height + vertical_padding,
+                    y1 - baseline - vertical_padding,
+                ),
+            ),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.55,
+            font_scale,
             (255, 255, 255),
-            1,
+            text_thickness,
             cv2.LINE_AA,
         )
 

@@ -216,6 +216,14 @@ def test_cross_class_deduplication_suppresses_at_exact_threshold() -> None:
     assert kept == [0]
 
 
+def test_annotation_scale_grows_with_large_images() -> None:
+    small = np.zeros((550, 1150, 3), dtype=np.uint8)
+    large = np.zeros((2250, 4000, 3), dtype=np.uint8)
+
+    assert traffic_app._annotation_scale(small) == 1.0
+    assert traffic_app._annotation_scale(large) == pytest.approx(4000 / 1152)
+
+
 def test_health(client: TestClient) -> None:
     response = client.get("/api/health")
 
