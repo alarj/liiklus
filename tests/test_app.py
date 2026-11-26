@@ -39,6 +39,8 @@ TEST_USER = traffic_app.User(
 @pytest.fixture(scope="module")
 def client() -> TestClient:
     environment = {
+        "CROSS_CLASS_DEDUP_DEFAULT": "1",
+        "CROSS_CLASS_IOU_THRESHOLD": "0.80",
         "GOOGLE_CLIENT_ID": "test.apps.googleusercontent.com",
         "SESSION_SECRET": "test-session-secret",
         "TRAINING_POOL_DIR": "/tmp/liiklus-test-training-pool",
@@ -68,11 +70,12 @@ def _upload(data: bytes, media_type: str, *, size: int | None = None) -> UploadF
 
 
 def _settings() -> traffic_app.Settings:
-    environment_settings = traffic_app.Settings.from_environment()
     return traffic_app.Settings(
-        model_dir=environment_settings.model_dir,
-        model_files=environment_settings.model_files,
+        model_dir=traffic_app.Path("/tmp"),
+        model_files=("best.onnx",),
         ort_intra_op_num_threads=3,
+        cross_class_dedup_default=1,
+        cross_class_iou_threshold=0.80,
         max_upload_bytes=5 * 1024 * 1024,
         max_image_pixels=10_000_000,
         training_pool_dir=traffic_app.Path("/tmp/liiklus-test-training-pool"),
@@ -165,6 +168,54 @@ def test_image_over_ten_megapixels_is_rejected_before_decode() -> None:
     assert error.value.status_code == 413
 
 
+def test_cross_class_deduplication_keeps_higher_confidence_duplicate() -> None:
+    boxes = np.asarray([[0, 0, 100, 100], [2, 2, 100, 100]], dtype=np.float32)
+    confidences = np.asarray([0.78, 0.76], dtype=np.float32)
+    class_ids = np.asarray([0, 2], dtype=np.int64)
+
+    kept = traffic_app._cross_class_deduplicate(
+        [1, 0], boxes, confidences, class_ids, 0.80
+    )
+
+    assert kept == [0]
+
+
+def test_cross_class_deduplication_keeps_low_iou_different_classes() -> None:
+    boxes = np.asarray([[0, 0, 100, 100], [20, 20, 50, 50]], dtype=np.float32)
+    confidences = np.asarray([0.78, 0.76], dtype=np.float32)
+    class_ids = np.asarray([0, 1], dtype=np.int64)
+
+    kept = traffic_app._cross_class_deduplicate(
+        [0, 1], boxes, confidences, class_ids, 0.80
+    )
+
+    assert kept == [0, 1]
+
+
+def test_cross_class_deduplication_does_not_touch_same_class() -> None:
+    boxes = np.asarray([[0, 0, 100, 100], [1, 1, 100, 100]], dtype=np.float32)
+    confidences = np.asarray([0.78, 0.76], dtype=np.float32)
+    class_ids = np.asarray([1, 1], dtype=np.int64)
+
+    kept = traffic_app._cross_class_deduplicate(
+        [0, 1], boxes, confidences, class_ids, 0.80
+    )
+
+    assert kept == [0, 1]
+
+
+def test_cross_class_deduplication_suppresses_at_exact_threshold() -> None:
+    boxes = np.asarray([[0, 0, 10, 10], [0, 0, 8, 10]], dtype=np.float32)
+    confidences = np.asarray([0.78, 0.76], dtype=np.float32)
+    class_ids = np.asarray([0, 2], dtype=np.int64)
+
+    kept = traffic_app._cross_class_deduplicate(
+        [0, 1], boxes, confidences, class_ids, 0.80
+    )
+
+    assert kept == [0]
+
+
 def test_health(client: TestClient) -> None:
     response = client.get("/api/health")
 
@@ -189,10 +240,17 @@ def test_detection_endpoints_with_synthetic_image(
         width: int,
         height: int,
         confidence_threshold: float,
+        cross_class_iou_threshold: float | None = None,
     ) -> traffic_app.ProcessedImage:
         nonlocal process_calls
         process_calls += 1
-        return original_process(image_data, width, height, confidence_threshold)
+        return original_process(
+            image_data,
+            width,
+            height,
+            confidence_threshold,
+            cross_class_iou_threshold,
+        )
 
     monkeypatch.setattr(default_detector, "process_bytes", counted_process_bytes)
 
@@ -204,6 +262,8 @@ def test_detection_endpoints_with_synthetic_image(
     assert payload["filename"] == "blank.jpg"
     assert payload["conf"] == traffic_app.DEFAULT_MODEL_CONFIDENCE
     assert payload["model"] == default_model
+    assert payload["cross_class_dedup"] == 1
+    assert payload["cross_class_iou_threshold"] == 0.8
     request_received_at = datetime.fromisoformat(
         payload["request_received_at"].replace("Z", "+00:00")
     )
@@ -214,7 +274,10 @@ def test_detection_endpoints_with_synthetic_image(
     assert payload["total"] == sum(payload["counts"].values())
     assert len(json_response.headers["X-Model-SHA256"]) == 64
 
-    image_response = client.post("/api/detect/image?conf=0.25", files=files)
+    image_response = client.post(
+        "/api/detect/image?conf=0.25&cross_class_dedup=0",
+        files=files,
+    )
 
     assert image_response.status_code == 200
     assert process_calls == 2
@@ -224,6 +287,8 @@ def test_detection_endpoints_with_synthetic_image(
     assert image_payload["filename"] == "blank.jpg"
     assert image_payload["conf"] == 0.25
     assert image_payload["model"] == default_model
+    assert image_payload["cross_class_dedup"] == 0
+    assert "cross_class_iou_threshold" not in image_payload
     image_request_received_at = datetime.fromisoformat(
         image_payload["request_received_at"].replace("Z", "+00:00")
     )
@@ -246,3 +311,21 @@ def test_detection_endpoints_with_synthetic_image(
     )
 
     assert invalid_model_response.status_code == 422
+
+    invalid_dedup_response = client.post(
+        "/api/detect?cross_class_dedup=true",
+        files=files,
+    )
+    assert invalid_dedup_response.status_code == 422
+
+    out_of_range_dedup_response = client.post(
+        "/api/detect?cross_class_dedup=2",
+        files=files,
+    )
+    assert out_of_range_dedup_response.status_code == 422
+
+    conflicting_response = client.post(
+        "/api/detect?cross_class_dedup=0&cross_class_iou_threshold=0.8",
+        files=files,
+    )
+    assert conflicting_response.status_code == 422

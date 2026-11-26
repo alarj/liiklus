@@ -39,7 +39,10 @@
             <p class="section-kicker" data-i18n="upload.kicker"></p>
             <h2 id="upload-title" data-i18n="upload.title"></h2>
           </div>
-          <span id="selectionStatus" class="status-badge" data-i18n="upload.empty_status"></span>
+          <div class="upload-actions primary-actions">
+            <button id="candidateButton" class="secondary-button" type="button" disabled data-i18n="candidate.open"></button>
+            <button id="analyzeButton" type="submit" form="detectForm" disabled data-i18n="upload.analyze"></button>
+          </div>
         </div>
 
         <form id="detectForm" novalidate>
@@ -69,24 +72,21 @@
           </div>
 
           <div class="analysis-controls">
-            <div class="analysis-fields">
-              <div class="field-group">
-                <label for="confidenceInput" data-i18n="upload.confidence_label"></label>
-                <input id="confidenceInput" name="conf" type="number" min="0.01" max="1" step="0.01" inputmode="decimal" data-i18n-placeholder="upload.confidence_placeholder" />
-                <p class="field-help" data-i18n="upload.confidence_help"></p>
-              </div>
-              <div class="field-group">
-                <label for="modelSelect" data-i18n="upload.model_label"></label>
-                <select id="modelSelect" name="model"></select>
-              </div>
+            <div class="field-group confidence-field">
+              <label for="confidenceInput" data-i18n="upload.confidence_label"></label>
+              <input id="confidenceInput" name="conf" type="number" min="0.01" max="1" step="0.01" inputmode="decimal" data-i18n-placeholder="upload.confidence_placeholder" />
+              <p class="field-help" data-i18n="upload.confidence_help"></p>
             </div>
-            <div class="analysis-submit">
-              <label class="toggle-row" for="threeLevelsInput"><input id="threeLevelsInput" type="checkbox" /><span data-i18n="upload.three_levels"></span></label>
-              <div class="primary-actions">
-                <button id="analyzeButton" type="submit" disabled data-i18n="upload.analyze"></button>
-                <button id="candidateButton" class="secondary-button" type="button" disabled data-i18n="candidate.open"></button>
-              </div>
+            <div class="field-group model-field">
+              <label for="modelSelect" data-i18n="upload.model_label"></label>
+              <select id="modelSelect" name="model"></select>
             </div>
+            <label class="switch-row cross-class-switch" for="crossClassDedupInput"><input id="crossClassDedupInput" type="checkbox" /><span class="switch-control" aria-hidden="true"></span><span data-i18n="upload.cross_class_dedup"></span></label>
+            <div id="crossClassThresholdGroup" class="field-group cross-class-threshold-field">
+              <label for="crossClassIouInput" data-i18n="upload.cross_class_iou_label"></label>
+              <input id="crossClassIouInput" name="cross_class_iou_threshold" type="number" min="0.01" max="1" step="0.01" inputmode="decimal" />
+            </div>
+            <label class="switch-row three-levels-switch" for="threeLevelsInput"><input id="threeLevelsInput" type="checkbox" /><span class="switch-control" aria-hidden="true"></span><span data-i18n="upload.three_levels"></span></label>
           </div>
         </form>
 
@@ -121,6 +121,8 @@
           <div><dt data-i18n="results.image_size"></dt><dd id="resultImageSize"></dd></div>
           <div><dt data-i18n="results.model"></dt><dd id="resultModel"></dd></div>
           <div><dt data-i18n="results.confidence"></dt><dd id="resultConfidence"></dd></div>
+          <div><dt data-i18n="results.cross_class_dedup"></dt><dd id="resultCrossClassDedup"></dd></div>
+          <div id="resultCrossClassIouRow"><dt data-i18n="results.cross_class_iou"></dt><dd id="resultCrossClassIou"></dd></div>
           <div><dt data-i18n="results.processing_time"></dt><dd id="resultDuration"></dd></div>
           <div><dt data-i18n="results.received_at"></dt><dd id="resultReceivedAt"></dd></div>
         </dl>

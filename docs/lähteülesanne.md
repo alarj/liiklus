@@ -2,8 +2,8 @@
 
 ## Dokumendi päritolu
 
-Dokumendi koostas algselt inimene. OpenAI Codex täiendas dokumenti 23. ja 24.
-novembril 2026 kasutajaga kokku lepitud tehniliste otsuste põhjal.
+Dokumendi koostas algselt inimene. OpenAI Codex täiendas dokumenti 23., 24. ja
+26. novembril 2026 kasutajaga kokku lepitud tehniliste otsuste põhjal.
 
 ## Sisukord
 
@@ -54,10 +54,21 @@ sõidukite (auto, buss, tramm) arvud ning koordinaadid.
 ## API otspunktid
 1. **`POST /api/detect`**
    - **Sisend:** `multipart/form-data` (`file`: pildifail), valikulised
-     query-parameetrid `conf` ja `model`. `conf` on mudeli tuvastuse minimaalne
+     query-parameetrid `conf`, `model`, `cross_class_dedup` ja
+     `cross_class_iou_threshold`. `conf` on mudeli tuvastuse minimaalne
      usalduslävend vaikeväärtusega `0.45`. `model` on mudelifaili nimi;
      puudumisel kasutatakse `MODEL_FILES_JSON` esimest mudelit.
-   - **Töötlus:** eeltöötlus -> ONNX inferents -> NMS (`iou=0.5`) -> koordinaatide teisendus algse pildi pikslitesse.
+     `cross_class_dedup` lubab ainult väärtusi `0` ja `1`; puudumisel kasutatakse
+     `CROSS_CLASS_DEDUP_DEFAULT` väärtust. Lävendit võib päringus anda ainult
+     sisselülitatud filtri korral ning selle puudumisel kasutatakse
+     `CROSS_CLASS_IOU_THRESHOLD` väärtust.
+   - **Töötlus:** eeltöötlus -> ONNX inferents -> sama klassi NMS (`iou=0.5`)
+     -> valikuline klassideülene duplikaadifilter -> koordinaatide teisendus
+     algse pildi pikslitesse. Klassideülene filter töötleb confidence'i järgi
+     kahanevalt esimese NMS-i läbinud kaste ja eemaldab madalama confidence'iga
+     eri klassi kasti, kui kastide standardne IoU on lävendiga võrdne või
+     sellest suurem. Sama klassi kaste ja ainult sisaldumise tõttu kattuvaid
+     objekte see filter ei eemalda.
    - **Väljund (JSON):**
      ```json
      {
@@ -67,6 +78,8 @@ sõidukite (auto, buss, tramm) arvud ning koordinaadid.
        "conf": 0.45,
        "model": "best v2.onnx",
        "model_sha256": "...",
+       "cross_class_dedup": 1,
+       "cross_class_iou_threshold": 0.8,
        "image_size": {"width": 1150, "height": 550},
        "counts": {"bus": 0, "car": 0, "tram": 0},
        "total": 0,
@@ -90,12 +103,17 @@ sõidukite (auto, buss, tramm) arvud ning koordinaadid.
      `.env` vaikeväärtust, kui query-parameeter puudub.
    - Väli `model` näitab tegelikult kasutatud mudelifaili ja `model_sha256`
      selle kontrollsummat.
+   - Väli `cross_class_dedup` näitab tegelikult kasutatud väärtust `0` või `1`.
+     `cross_class_iou_threshold` tagastatakse ainult siis, kui filter oli sees.
 3. **`GET /api/health`**
    - Tagastab `{"status": "ok"}`.
 4. **Treeningupildi otspunktid**
    - `/api/training-pool` haldab kandidaate ja nende algpilte. Kandidaadi
      eelmärgendus kasutab vormiväljas `model` valitud mudelit või välja
-     puudumisel vaikemudelit.
+     puudumisel vaikemudelit. Vormiväljad `cross_class_dedup` ja
+     `cross_class_iou_threshold` järgivad tuvastusotspunktidega sama lepingut;
+     tegelikult rakendatud väärtused salvestatakse kandidaadi `analysis_json`
+     metaandmetesse. Väljalülitatud filtri korral lävendit ei salvestata.
    - `/api/training-packages` haldab pakke, piltide seoseid ja ZIP-eksporti.
    - Täpne andmemudel on failis [`../db/erd.md`](../db/erd.md).
 
@@ -107,6 +125,10 @@ sõidukite (auto, buss, tramm) arvud ning koordinaadid.
   kolme operaatorite arvutuslõime. Eraldi Docker CPU-piirangut ei rakendata.
 - Mudeli usalduslävendi vaikeväärtus tuleb `.env` muutujast
   `MODEL_CONFIDENCE_THRESHOLD=0.45`; päringu `conf` võib selle üle kirjutada.
+- Klassideülese duplikaadifiltri vaikeolek ja IoU lävend tulevad kohustuslikest
+  `.env` muutujatest `CROSS_CLASS_DEDUP_DEFAULT` ja
+  `CROSS_CLASS_IOU_THRESHOLD`; päringu parameetrid võivad need konkreetse
+  analüüsi jaoks üle kirjutada.
 - Mudelite kataloog ühendatakse konteinerisse read-only mount'ina ja kõik
   seadistatud mudelid laaditakse API käivitamisel mällu.
 - Kohalik ligipääs on `http://127.0.0.1:8010`.
@@ -143,6 +165,16 @@ sõidukite (auto, buss, tramm) arvud ning koordinaadid.
 - UI kuvab API antud mudelinimekirja dropdown'is samas järjestuses. Mudeli
   vahetamine eemaldab vana analüüsitulemuse. Uue pildi valimine eemaldab kolme
   taseme valiku, kuid jätab mudelivaliku alles.
+- UI saab klassideülese duplikaadifiltri algoleku ja IoU lävendi API kaudu
+  serveri seadistusest. Väljalülitatud filtri korral lävendivälja ei kuvata ega
+  saadeta. Tulemuste metaandmetes kuvatakse filtri tegelik olek ning lävend
+  ainult siis, kui filter oli sees. JSON-vaates kehtib sama tingimus.
+- Analüüsi ja treeningukandidaadi tegevusnupud paiknevad „Vali pilt“ pealkirjaga
+  samal päisereal ning „Analüüsi pilti“ on kõige parempoolsem nupp. Pildiala all paiknevad kompaktsed
+  tuvastuslävendi ja mudeli väljad, duplikaadifiltri switch, selle järel
+  tingimuslik kompaktne IoU väli ning paremas servas kolme taseme switch.
+  Pildi valiku olekut eraldi sildiga ei dubleerita. Kitsamal ekraanil murtakse
+  juhtelemendid ilma kattumiseta järgmistele ridadele.
 - Kolme taseme režiimis teeb UI kolm `/api/detect/image` päringut lävenditega
   `default`, `max(0.01, default - 0.20)` ja
   `max(0.01, default - 0.40)` ning kuvab kolm tulemust kõrvuti.

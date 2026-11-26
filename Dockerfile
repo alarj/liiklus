@@ -31,6 +31,7 @@ COPY requirements-test.txt ./
 RUN pip install --no-cache-dir --requirement requirements-test.txt
 
 COPY --chown=app:app tests ./tests
+COPY --chown=app:app ui ./ui
 
 USER app
 
