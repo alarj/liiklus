@@ -67,5 +67,19 @@ def test_live_monitoring_requires_a_positive_integer_interval() -> None:
     javascript = (PROJECT_ROOT / "ui/assets/app-v2.js").read_text(encoding="utf-8")
 
     assert 'profile?.capture_interval_seconds == null ? ""' in javascript
-    assert 'Number.isInteger(value) && value > 0' in javascript
+    assert 'preventInvalidLiveIntervalKey' in javascript
+    assert '["-", "+", ".", ",", "e", "E"]' in javascript
+    assert '/^[1-9]\\d*$/.test(value)' in javascript
+    assert 'input.value = input.dataset.lastValid || ""' in javascript
+    assert 'Number.isInteger(value)' in javascript
     assert '!validLiveInterval()' in javascript
+
+
+def test_user_role_opens_live_view_and_hides_training_controls() -> None:
+    javascript = (PROJECT_ROOT / "ui/assets/app-v2.js").read_text(encoding="utf-8")
+
+    assert 'state.user?.role === "ADMIN"' in javascript
+    assert 'switchView(isAdmin() ? "analysis" : "live")' in javascript
+    assert 'elements.trainingTab.classList.toggle("hidden", !admin)' in javascript
+    assert 'elements.candidateButton.classList.toggle("hidden", !admin)' in javascript
+    assert '!isAdmin() || !state.live.paused || !state.live.result' in javascript

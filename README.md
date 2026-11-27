@@ -34,6 +34,13 @@ Eraldi `liiklus-ui` konteiner serveerib Google'i sisselogimisega staatilist
 liidest. UI kasutab sama FastAPI JSON API-t tuvastuseks, treeningukandidaatideks
 ja treeningpakkideks.
 
+Roll `USER` saab kasutada pildianalüüsi ja kaamerate live-vaadet ning avab
+pärast sisselogimist vaikimisi live-vaate. Roll `ADMIN` saab lisaks kasutada
+kõiki treeningukandidaatide ja treeningupakkide funktsioone. Treeningu API
+otspunktid kontrollivad `ADMIN` rolli igal päringul Oracle'ist loetud kasutaja
+andmete alusel. Täpne maatriks on failis
+[`docs/rollioigused.md`](docs/rollioigused.md).
+
 Otspunktid:
 
 - `GET /api/health`

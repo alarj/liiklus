@@ -62,6 +62,13 @@ TEST_USER = traffic_app.User(
     role_code="USER",
     enabled=True,
 )
+TEST_ADMIN = replace(
+    TEST_USER,
+    public_id="00000000-0000-0000-0000-000000000002",
+    email="admin@example.test",
+    display_name="Test Admin",
+    role_code="ADMIN",
+)
 LIVE_VIEWER_ID = "test-viewer-00000001"
 
 
@@ -81,7 +88,7 @@ def client() -> TestClient:
         "SESSION_SECRET": "test-session-secret",
         "TRAINING_POOL_DIR": "/tmp/liiklus-test-training-pool",
     }
-    traffic_app.app.dependency_overrides[traffic_app.current_user] = lambda: TEST_USER
+    traffic_app.app.dependency_overrides[traffic_app.current_user] = lambda: TEST_ADMIN
     with patch.dict(os.environ, environment), patch.object(
         traffic_app.OracleRepository, "from_env", return_value=FakeRepository()
     ):
@@ -127,6 +134,17 @@ def _settings() -> traffic_app.Settings:
         google_client_id="test.apps.googleusercontent.com",
         session_secret="test-session-secret",
     )
+
+
+def test_training_endpoints_require_admin(client: TestClient) -> None:
+    traffic_app.app.dependency_overrides[traffic_app.current_user] = lambda: TEST_USER
+    try:
+        response = client.get("/api/training-pool")
+    finally:
+        traffic_app.app.dependency_overrides[traffic_app.current_user] = lambda: TEST_ADMIN
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Administrator access required"
 
 
 def _enable_live_profile(

@@ -110,7 +110,8 @@ function bindEvents() {
   elements.trainingTab.addEventListener("click", () => switchView("training"));
   elements.trainingProfileSelect.addEventListener("change", handleTrainingProfileChange);
   elements.liveProfileSelect.addEventListener("change", handleLiveProfileChange);
-  elements.liveIntervalInput.addEventListener("input", updateLiveButtons);
+  elements.liveIntervalInput.addEventListener("keydown", preventInvalidLiveIntervalKey);
+  elements.liveIntervalInput.addEventListener("input", normalizeLiveIntervalInput);
   elements.liveCrossClassDedupInput.addEventListener("change", updateLiveCrossClassControls);
   elements.liveDetectionAreaInput.addEventListener("change", updateLiveDetectionAreaOverlay);
   elements.liveStartButton.addEventListener("click", toggleLiveMonitoring);
@@ -306,6 +307,7 @@ function handleLiveProfileChange() {
   state.live.sessionCounts = Object.fromEntries((profile?.classes || []).map((item) => [item.code, 0]));
   state.live.sessionTotal = 0;
   elements.liveIntervalInput.value = profile?.capture_interval_seconds == null ? "" : String(profile.capture_interval_seconds);
+  elements.liveIntervalInput.dataset.lastValid = elements.liveIntervalInput.value;
   elements.liveConfidenceInput.value = String(profile?.default_confidence ?? DEFAULT_CONFIDENCE);
   renderSelectModels(elements.liveModelSelect, profile?.models || [], profile?.default_model || "");
   elements.liveCrossClassDedupInput.checked = Number(state.user?.cross_class_dedup_default) === 1;
@@ -549,12 +551,29 @@ function updateLiveButtons() {
   elements.liveStartButton.textContent = translate(state.live.running ? "live.stop" : "live.start");
   elements.liveStartButton.disabled = state.live.running ? false : !available || !validLiveInterval() || state.live.busy;
   elements.liveRefreshButton.disabled = !available || state.live.busy;
-  elements.liveCandidateButton.classList.toggle("hidden", !state.live.paused || !state.live.result);
+  elements.liveCandidateButton.classList.toggle("hidden", !isAdmin() || !state.live.paused || !state.live.result);
+}
+
+function preventInvalidLiveIntervalKey(event) {
+  if (["-", "+", ".", ",", "e", "E"].includes(event.key)) event.preventDefault();
+}
+
+function normalizeLiveIntervalInput() {
+  const input = elements.liveIntervalInput;
+  const value = input.value.trim();
+  if (value === "") {
+    input.dataset.lastValid = "";
+  } else if (/^[1-9]\d*$/.test(value)) {
+    input.dataset.lastValid = value;
+  } else {
+    input.value = input.dataset.lastValid || "";
+  }
+  updateLiveButtons();
 }
 
 function validLiveInterval() {
   const value = Number(elements.liveIntervalInput.value);
-  return elements.liveIntervalInput.value.trim() !== "" && Number.isInteger(value) && value > 0;
+  return /^[1-9]\d*$/.test(elements.liveIntervalInput.value) && Number.isInteger(value);
 }
 
 function setLiveStatus(key, success = false) {
@@ -607,7 +626,18 @@ async function handleGoogleCredential(value) {
 function showApplication() {
   elements.loginView.classList.add("hidden");
   elements.appShell.classList.remove("hidden");
-  refreshTrainingCount();
+  configureRoleAccess();
+  switchView(isAdmin() ? "analysis" : "live");
+  if (isAdmin()) refreshTrainingCount();
+}
+
+function isAdmin() { return state.user?.role === "ADMIN"; }
+
+function configureRoleAccess() {
+  const admin = isAdmin();
+  elements.trainingTab.classList.toggle("hidden", !admin);
+  elements.candidateButton.classList.toggle("hidden", !admin);
+  if (!admin) elements.liveCandidateButton.classList.add("hidden");
 }
 
 async function logout() {
@@ -844,6 +874,7 @@ async function saveCandidate(event) {
 }
 
 function switchView(view) {
+  if (view === "training" && !isAdmin()) view = "live";
   const analysis = view === "analysis";
   const live = view === "live";
   const training = view === "training";
@@ -858,6 +889,7 @@ function switchView(view) {
 }
 
 async function refreshTrainingCount() {
+  if (!isAdmin()) return;
   const profile = elements.trainingProfileSelect.value || state.user?.default_camera_profile || "";
   try { const data = await apiRequest(`/training-pool?profile=${encodeURIComponent(profile)}&limit=1`); elements.trainingCount.textContent = `(${data.total})`; }
   catch (_) { elements.trainingCount.textContent = ""; }

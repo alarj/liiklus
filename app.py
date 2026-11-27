@@ -1681,6 +1681,14 @@ async def current_user(request: Request) -> User:
     return user
 
 
+async def require_admin(
+    user: Annotated[User, Depends(current_user)],
+) -> User:
+    if user.role_code != "ADMIN":
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Administrator access required")
+    return user
+
+
 def _csrf_token(request: Request) -> str:
     token = request.session.get("csrf_token")
     if not isinstance(token, str):
@@ -2459,7 +2467,7 @@ def create_training_candidate(
         float | None,
         Form(ge=0.01, le=1.0),
     ] = None,
-    user: User = Depends(current_user),
+    user: User = Depends(require_admin),
 ) -> dict[str, Any]:
     _verify_csrf(request)
     settings: Settings = request.app.state.settings
@@ -2485,7 +2493,7 @@ def create_training_candidate(
 async def create_live_training_candidate(
     body: LiveTrainingCandidateRequest,
     request: Request,
-    user: Annotated[User, Depends(current_user)],
+    user: Annotated[User, Depends(require_admin)],
 ) -> dict[str, Any]:
     _verify_csrf(request)
     profile = _camera_profile(request, body.profile)
@@ -2516,7 +2524,7 @@ async def create_live_training_candidate(
 @app.get("/api/training-pool")
 def list_training_candidates(
     request: Request,
-    user: Annotated[User, Depends(current_user)],
+    user: Annotated[User, Depends(require_admin)],
     q: str = "",
     package: str = "",
     profile: str | None = None,
@@ -2556,7 +2564,7 @@ def list_training_candidates(
 def training_candidate_image(
     image_id: str,
     request: Request,
-    user: Annotated[User, Depends(current_user)],
+    user: Annotated[User, Depends(require_admin)],
     thumbnail: bool = False,
 ) -> Response:
     del user
@@ -2588,7 +2596,7 @@ def training_candidate_image(
 def delete_training_candidate(
     image_id: str,
     request: Request,
-    user: Annotated[User, Depends(current_user)],
+    user: Annotated[User, Depends(require_admin)],
 ) -> Response:
     del user
     _verify_csrf(request)
@@ -2606,7 +2614,7 @@ def delete_training_candidate(
 def create_training_package(
     body: PackageCreateRequest,
     request: Request,
-    user: Annotated[User, Depends(current_user)],
+    user: Annotated[User, Depends(require_admin)],
 ) -> dict[str, Any]:
     _verify_csrf(request)
     name = body.name.strip()
@@ -2626,7 +2634,7 @@ def create_training_package(
 @app.get("/api/training-packages")
 def list_training_packages(
     request: Request,
-    user: Annotated[User, Depends(current_user)],
+    user: Annotated[User, Depends(require_admin)],
     profile: str | None = None,
 ) -> list[dict[str, Any]]:
     del user
@@ -2645,7 +2653,7 @@ def list_training_packages(
 def get_training_package(
     package_id: str,
     request: Request,
-    user: Annotated[User, Depends(current_user)],
+    user: Annotated[User, Depends(require_admin)],
 ) -> dict[str, Any]:
     del user
     try:
@@ -2670,7 +2678,7 @@ def add_training_package_images(
     package_id: str,
     body: PackageImagesRequest,
     request: Request,
-    user: Annotated[User, Depends(current_user)],
+    user: Annotated[User, Depends(require_admin)],
 ) -> dict[str, Any]:
     _verify_csrf(request)
     try:
@@ -2688,7 +2696,7 @@ def remove_training_package_image(
     package_id: str,
     image_id: str,
     request: Request,
-    user: Annotated[User, Depends(current_user)],
+    user: Annotated[User, Depends(require_admin)],
 ) -> Response:
     del user
     _verify_csrf(request)
@@ -2714,7 +2722,7 @@ def _delete_file(path: str) -> None:
 def download_training_package(
     package_id: str,
     request: Request,
-    user: Annotated[User, Depends(current_user)],
+    user: Annotated[User, Depends(require_admin)],
 ) -> FileResponse:
     _verify_csrf(request)
     try:

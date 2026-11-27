@@ -339,6 +339,8 @@ Uuele vahekaardile lisatakse:
 - kastidega tulemuspilt ja ROI SVG-overlay;
 - hetke- ja sessiooniloendurid.
 
+Intervalliväli lubab sisestada ainult positiivseid täisarve alates väärtusest
+`1`; kümnendkohad, märgiga ja eksponentkujul väärtused lükatakse UI-s tagasi.
 Intervalli muutmine rakendub järgmise ooteperioodi arvutamisel. „Värskenda
 kohe“ käivitab tsükli ilma intervalli lõppu ootamata, kuid ei tekita
 paralleelpäringut.

@@ -119,6 +119,15 @@ nginx-liidestuse ja avalike HTTP-vastuste kontrollid.
     alanud ja pärast pausi lõpetanud live-päring ei kirjuta pausile fikseeritud
     kaadrit üle.
 
+13. **Rolliõigused.** Kontrollida, et `USER` saab treeningu API-otspunktidelt
+    HTTP 403 vastuse ning `ADMIN` säilitab olemasoleva ligipääsu. UI lepingus
+    kontrollida, et `USER` avab live-vaate ning treeninguvahekaart ja mõlemad
+    treeningusse saatmise nupud on talle peidetud.
+
+14. **Live-intervalli sisend.** Kontrollida, et intervalliväli aktsepteerib
+    ainult positiivseid täisarve alates väärtusest `1` ning tõrjub väärtused
+    `0`, negatiivsed arvud, kümnendkohad ja eksponentkuju.
+
 Automatiseeritud testid katavad punktid 1 ja 2, punktide 3 ja 4 API lepingu
 sünteetilise pildiga ning punkti 5 järeltöötluse ja API lepingu. Staatilised
 UI-testid katavad punkti 6 struktuuri ja päringuparameetrid. Punktid 7–9
@@ -141,6 +150,15 @@ Pärast loa saamist märgitakse iga kontrolli juurde kuupäev, kasutatud sisend,
 tulemus ja võimalik kõrvalekalle. Pärispilte Git-i ega andmebaasi ei lisata.
 
 ## 8. Käivitatud kontrollid
+
+### 27. november 2026 — `USER` ja `ADMIN` rolliõigused
+
+- Kontrolliti, et `USER` saab treeningu API-lt HTTP 403 vastuse, `ADMIN` saab
+  jätkuvalt live-kaadri treeningusse saata ning UI avab `USER` rollile
+  live-vaate ja peidab treeningufunktsioonid.
+- Tulemus: `3 passed` (0,78 s).
+- Pytest väljastas ühe olemasoleva Starlette `TestClient` / `httpx`
+  deprekatsioonihoiatuse; see ei põhjustanud testi ebaõnnestumist.
 
 ### 27. november 2026 — pausile fikseeritud live-kaadri regressioonitest
 
