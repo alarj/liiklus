@@ -15,6 +15,11 @@ def test_cross_class_filter_controls_and_result_metadata_are_present() -> None:
     assert 'id="crossClassIouInput"' in html
     assert 'id="resultCrossClassDedup"' in html
     assert 'id="resultCrossClassIouRow"' in html
+    assert 'id="profileSelect"' in html
+    assert 'id="resultProfile"' in html
+    assert 'id="detectionAreaInput"' in html
+    assert 'id="detectionAreaRow"' in html
+    assert 'id="detectionAreaOverlay"' in html
 
 
 def test_cross_class_filter_is_sent_to_analysis_and_training_requests() -> None:
@@ -25,6 +30,8 @@ def test_cross_class_filter_is_sent_to_analysis_and_training_requests() -> None:
     assert 'cross_class_dedup: "0"' in javascript
     assert 'cross_class_dedup: "1"' in javascript
     assert 'options.cross_class_iou_threshold = threshold' in javascript
+    assert "profile: elements.profileSelect.value" in javascript
+    assert 'body.append("profile", elements.profileSelect.value)' in javascript
 
 
 def test_cross_class_filter_ui_texts_are_translated() -> None:
@@ -36,3 +43,7 @@ def test_cross_class_filter_ui_texts_are_translated() -> None:
     assert translations["upload.cross_class_iou_label"]
     assert translations["results.cross_class_dedup"]
     assert translations["results.cross_class_iou"]
+    assert translations["upload.profile_label"]
+    assert translations["upload.show_detection_area"]
+    assert translations["results.profile"]
+    assert translations["classes.van-truck"]

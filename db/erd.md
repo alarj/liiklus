@@ -3,7 +3,8 @@
 ## 1. Dokumendi päritolu
 
 Dokumendi koostas OpenAI Codex 24. novembril 2026 kasutaja kinnitatud
-aktiivõppe, kasutajate, treeningpiltide ja treeningpakkide nõuete põhjal.
+aktiivõppe, kasutajate, treeningpiltide ja treeningpakkide nõuete põhjal ning
+täiendas 27. novembril 2026 kaameraprofiilide seostega.
 
 ## 2. Mermaid ER-diagramm
 
@@ -14,6 +15,9 @@ erDiagram
     APP_USERS o|--o{ TRAINING_PACKAGES : first_downloads
     APP_USERS ||--o{ TRAINING_PACKAGE_IMAGES : adds_to_package
     APP_USERS ||--o{ TRAINING_PACKAGE_DOWNLOADS : downloads
+
+    CAMERA_PROFILES ||--o{ TRAINING_IMAGES : classifies
+    CAMERA_PROFILES ||--o{ TRAINING_PACKAGES : scopes
 
     TRAINING_IMAGES ||--o{ TRAINING_PACKAGE_IMAGES : belongs_to
     TRAINING_PACKAGES ||--o{ TRAINING_PACKAGE_IMAGES : contains
@@ -34,10 +38,29 @@ erDiagram
         TIMESTAMP last_updated
     }
 
+    CAMERA_PROFILES {
+        NUMBER camera_profile_id PK
+        VARCHAR2 profile_code
+        NUMBER profile_version
+        VARCHAR2 profile_name
+        NUMBER sort_order
+        NUMBER is_default
+        VARCHAR2 source_image_url
+        JSON model_files_json
+        JSON vehicle_classes_json
+        JSON roi_mask_json
+        NUMBER default_confidence
+        DATE start_date
+        DATE end_date
+        TIMESTAMP created
+        TIMESTAMP last_updated
+    }
+
     TRAINING_IMAGES {
         NUMBER training_image_id PK
         VARCHAR2 public_id UK
         NUMBER candidate_by_user_id FK
+        NUMBER camera_profile_id FK
         VARCHAR2 original_filename
         VARCHAR2 image_relative_path UK
         VARCHAR2 label_relative_path UK
@@ -67,6 +90,7 @@ erDiagram
         VARCHAR2 public_id UK
         VARCHAR2 package_name UK
         NUMBER created_by_user_id FK
+        NUMBER camera_profile_id FK
         TIMESTAMP first_downloaded_at
         NUMBER first_downloaded_by_user_id FK
         DATE start_date
@@ -103,6 +127,14 @@ erDiagram
 ## 3. Olulised reeglid
 
 - `TRAINING_PACKAGES.package_name` on unikaalne.
+- Aktiivse `CAMERA_PROFILES.profile_code` kohta saab olla üks versioon ja
+  aktiivseid vaikeprofiile saab olla maksimaalselt üks. Rakendus nõuab
+  käivitamisel täpselt ühte aktiivset vaikeprofiili.
+- Kaameraprofiili `model_files_json` on järjestatud loend, mille esimene
+  element on profiili vaikemudel. Mudelifailid ise asuvad serveri
+  `MODEL_DIR` kataloogis.
+- Iga treeningpilt ja treeningpakk kuulub ühele konkreetsele
+  kaameraprofiilile. Pakki võib lisada ainult sama profiili pilte.
 - Sama pilt võib kuuluda mitmesse paketti; sama pildi ja paketi aktiivne seos
   võib esineda ainult üks kord.
 - Paketi koosseisu võib muuta kuni esimese allalaadimiseni. Esimene

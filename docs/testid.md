@@ -3,8 +3,9 @@
 ## 1. Dokumendi päritolu
 
 Dokumendi koostas OpenAI Codex 23. novembril 2026 kasutaja nõudel ja täiendas
-26. novembril 2026 klassideülese duplikaadifiltri kontrollidega. Testiplaan on
-teadlikult minimaalne ja vajab enne käivitamist kasutaja heakskiitu.
+26. novembril 2026 klassideülese duplikaadifiltri ning 27. novembril 2026
+kaameraprofiilide aluskihi kontrollidega. Testiplaan on teadlikult minimaalne
+ja vajab enne käivitamist kasutaja heakskiitu.
 
 ## 2. Sisukord
 
@@ -48,7 +49,11 @@ nginx-liidestuse ja avalike HTTP-vastuste kontrollid.
 4. **Pärispildi visualiseering.** Saata sama pilt otspunktile
    `POST /api/detect/image`; kontrollida, et vastus sisaldab sama tuvastuse
    JSON-i ning `annotated_image.base64` dekodeerub avatavaks JPEG-iks, mille
-   kastid vastavad vastuse tuvastustele. Kontrollida, et päringu jooksul
+   kastid vastavad vastuse tuvastustele. Kontrollida, et API JPEG ei sisalda
+   ROI joont ega tumendust. ROI-maskiga profiili korral kontrollida UI-s, et
+   maski polügooni piir on nähtav punase katkendjoonena ja välisala on veidi
+   tumendatud; lüliti peab peitma mõlemad ning uue pildi valik need taastama.
+   ROI-polügoonita profiili korral ei kuvata lülitit. Kontrollida, et päringu jooksul
    tehakse ainult üks mudeli inferents. Võrrelda ligikaudu 1152 px ja 4000 px
    laiust pilti ning kontrollida, et UI-s vähendatud pildil säilivad kastide ja
    klassitekstide võrreldav loetavus.
@@ -82,13 +87,21 @@ nginx-liidestuse ja avalike HTTP-vastuste kontrollid.
    Kinnitada, et märgendatud pilt on samal ajal põhitulemuses nähtav.
 9. **Proxy ja avalik health.** Kontrollida, et avalik nginx suunab `/` UI-le,
    `/api/` API-le ning `GET /api/health` jääb avalikult kättesaadavaks.
+10. **Kaameraprofiilide aluskiht.** Kontrollida, et profiilide mudelijärjestus
+    säilib, täpselt üks aktiivne profiil peab olema vaikimisi ning mudeli
+    fikseeritud kõrgus ja laius loetakse ONNX sisendkujust. Kontrollida, et
+    dünaamiline kõrgus või laius lükatakse tagasi, ROI-mask täidab polügooni
+    välise ala määratud värviga ja `1280 × 720` pilt moodustab `1280 × 736`
+    lõuendil koos maski ning alumise halli täitega õige tensori. Kontrollida ka
+    olemasoleva vaikeprofiili API regressiooni.
 
 Automatiseeritud testid katavad punktid 1 ja 2, punktide 3 ja 4 API lepingu
 sünteetilise pildiga ning punkti 5 järeltöötluse ja API lepingu. Staatilised
 UI-testid katavad punkti 6 struktuuri ja päringuparameetrid. Punktid 7–9
 kontrollivad UI-d ja selle liidestust.
 Pärispildi sisuline tulemus kontrollitakse eraldi pärast kasutajalt testpildi
-saamist.
+saamist. Punkti 10 automatiseeritud ühiktestid ei ühendu Oracle'iga ega muuda
+andmeid. Migratsiooniskripti ei käivitata testide osana.
 
 ## 6. Käivitamise sagedus
 
@@ -104,6 +117,43 @@ Pärast loa saamist märgitakse iga kontrolli juurde kuupäev, kasutatud sisend,
 tulemus ja võimalik kõrvalekalle. Pärispilte Git-i ega andmebaasi ei lisata.
 
 ## 8. Käivitatud kontrollid
+
+### 27. november 2026 — profiilivalik ja kahe profiili pärispildid
+
+- Staatilised Python-, JavaScripti- ja diffikontrollid läbisid kontrolli.
+- Värske test-image'iga läbisid kõik 22 automatiseeritud testi kontrolli
+  2,31 sekundiga. Testiväljundis oli kaks mittekriitilist
+  deprekatsioonihoiatust.
+- API ja UI image'id ehitati uuesti ning konteinerid loodi värske koodiga.
+- Päris Oracle'i JSON-väärtused tagastusid `Decimal` arvudena. Profiili
+  validaatorit täiendati neid korrektselt normaliseerima ja regressioonitest
+  lisati.
+- Kasutaja antud `1280 × 720` `cam217` pilt saadeti töötavale otspunktile
+  `POST /api/detect/image?profile=cam217`. Vastus oli HTTP 200, kasutas
+  profiili `cam217`, mudelit `cam217 v2.onnx` ja lävendit 0,45 ning tagastas
+  ühe bussi ja kuus autot. Annoteeritud pilt dekodeerus ja kastid paiknesid
+  visuaalselt sõidukitel.
+- Kasutaja antud `1150 × 550` Pärnu pilt saadeti nii profiiliparameetrita kui
+  `profile=parnu-mnt-karja` parameetriga. Mõlemad HTTP 200 vastused kasutasid
+  mudelit `best v3.onnx` ja tagastasid identselt kolm autot ning ühe trammi.
+  Annoteeritud pilt dekodeerus ja kastid paiknesid visuaalselt sõidukitel.
+- Testpilte ei lisatud projekti ega andmebaasi. API konteinerisse loodud
+  ajutised koopiad olid ainult testi sisend- ja väljundfailid.
+
+### 27. november 2026 — kaameraprofiilide aluskiht
+
+- Kasutaja loal käivitati
+  `docker compose --profile testing run --build --rm testing`.
+- Kõik 21 testi läbisid kontrolli 2,68 sekundiga.
+- Uued kontrollid hõlmasid vaikeprofiili nõuet, profiili mudelijärjestust,
+  ROI-polügoonmaski, maski ja alumise halli täite moodustamist samal
+  `1280 × 736` lõuendil ning ONNX-mudeli fikseeritud sisendmõõdu lugemist ja
+  dünaamilise kõrguse või laiuse tagasilükkamist.
+- Testid kasutasid fake-repository't. Oracle'iga ei ühendutud ja
+  `db/schema/002_camera_profiles.sql` migratsiooni ei käivitatud.
+- Testiväljundis oli kolm deprekatsioonihoiatust: üks FastAPI TestClienti
+  `httpx` integratsiooni ja kaks Starlette'i HTTP 422 konstandi kohta.
+  Hoiatused ei põhjustanud testide ebaõnnestumist.
 
 ### 26. november 2026 — klassideülene duplikaadifilter
 
