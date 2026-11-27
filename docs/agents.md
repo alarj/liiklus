@@ -133,6 +133,8 @@ Registrit tuleb täiendada kohe, kui projektile lisandub README, andmeskeem, API
 - [`.env.example`](../.env.example) — käituskeskkonna seadistuse näidis.
 - [`db/erd.md`](../db/erd.md) — Oracle'i aktiivõppe andmemudel, tabelid, seosed ja terviklusreeglid.
 - [`db/schema/001_core_schema.sql`](../db/schema/001_core_schema.sql) — Oracle'i skeemi loomise skript.
+- [`db/schema/002_camera_profiles.sql`](../db/schema/002_camera_profiles.sql) — olemasoleva skeemi kaameraprofiilide migratsioon; käivitamine nõuab kasutaja eraldi luba.
+- [`kaameraprofiilide-täiendusettepanek.md`](kaameraprofiilide-täiendusettepanek.md) — kaameraprofiilide, ROI-maskimise ja profiilipõhiste treeningandmete kinnitatud teostuskavand.
 - [`tests/test_app.py`](../tests/test_app.py) — automatiseeritud API ja eeltöötluse testid.
 - [`tests/test_ui_contract.py`](../tests/test_ui_contract.py) — UI staatilise lepingu testid.
 - [`requirements-test.txt`](../requirements-test.txt) — testide fikseeritud sõltuvused.

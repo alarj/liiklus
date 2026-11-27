@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import uuid
 from contextlib import contextmanager
@@ -63,6 +64,17 @@ def _utc_datetime(value: Any) -> Any:
 
 def _rows(cursor: Any) -> list[dict[str, Any]]:
     return [_row(cursor, value) for value in cursor.fetchall()]  # type: ignore[misc]
+
+
+def _json_document(value: Any, field_name: str) -> Any:
+    if hasattr(value, "read"):
+        value = value.read()
+    if isinstance(value, (str, bytes, bytearray)):
+        try:
+            return json.loads(value)
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise RuntimeError(f"Invalid JSON in camera_profiles.{field_name}") from exc
+    return value
 
 
 def _returning_number(variable: Any) -> int:
@@ -177,7 +189,34 @@ class OracleRepository:
             raise NotFoundError("User not found")
         return _user_from_row(row)
 
-    def training_history(self, source_sha256: str) -> dict[str, Any] | None:
+    def list_camera_profiles(self) -> list[dict[str, Any]]:
+        with self._connection() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT camera_profile_id, profile_code, profile_version,
+                       profile_name, sort_order, is_default, source_image_url,
+                       model_files_json, vehicle_classes_json, roi_mask_json,
+                       default_confidence
+                  FROM camera_profiles
+                 WHERE end_date IS NULL
+                 ORDER BY sort_order, profile_name, profile_version
+                """
+            )
+            profiles = _rows(cursor)
+        for profile in profiles:
+            for field_name in (
+                "model_files_json",
+                "vehicle_classes_json",
+                "roi_mask_json",
+            ):
+                profile[field_name] = _json_document(
+                    profile[field_name], field_name
+                )
+        return profiles
+
+    def training_history(
+        self, source_sha256: str, camera_profile_id: int
+    ) -> dict[str, Any] | None:
         with self._connection() as connection, connection.cursor() as cursor:
             cursor.execute(
                 """
@@ -186,9 +225,13 @@ class OracleRepository:
                   FROM training_images ti
                   JOIN app_users u ON u.user_id = ti.candidate_by_user_id
                  WHERE ti.source_sha256 = :source_sha256
+                   AND ti.camera_profile_id = :camera_profile_id
                  ORDER BY ti.created
                 """,
-                {"source_sha256": source_sha256},
+                {
+                    "source_sha256": source_sha256,
+                    "camera_profile_id": camera_profile_id,
+                },
             )
             candidates = _rows(cursor)
             if not candidates:
@@ -236,7 +279,8 @@ class OracleRepository:
                 cursor.execute(
                     """
                     INSERT INTO training_images (
-                        public_id, candidate_by_user_id, original_filename,
+                        public_id, candidate_by_user_id, camera_profile_id,
+                        original_filename,
                         image_relative_path, label_relative_path,
                         source_media_type, stored_media_type,
                         source_size_bytes, stored_size_bytes,
@@ -244,7 +288,8 @@ class OracleRepository:
                         source_sha256, stored_sha256, reason, tags_json,
                         analysis_json, model_sha256, label_confidence
                     ) VALUES (
-                        :public_id, :candidate_by_user_id, :original_filename,
+                        :public_id, :candidate_by_user_id, :camera_profile_id,
+                        :original_filename,
                         :image_relative_path, :label_relative_path,
                         :source_media_type, :stored_media_type,
                         :source_size_bytes, :stored_size_bytes,
@@ -440,17 +485,27 @@ class OracleRepository:
             connection.commit()
         return row
 
-    def create_training_package(self, name: str, user_id: int) -> dict[str, Any]:
+    def create_training_package(
+        self, name: str, user_id: int, camera_profile_id: int
+    ) -> dict[str, Any]:
         public_id = str(uuid.uuid4())
         with self._connection() as connection, connection.cursor() as cursor:
             try:
                 cursor.execute(
                     """
                     INSERT INTO training_packages (
-                        public_id, package_name, created_by_user_id
-                    ) VALUES (:public_id, :package_name, :user_id)
+                        public_id, package_name, created_by_user_id,
+                        camera_profile_id
+                    ) VALUES (
+                        :public_id, :package_name, :user_id, :camera_profile_id
+                    )
                     """,
-                    {"public_id": public_id, "package_name": name, "user_id": user_id},
+                    {
+                        "public_id": public_id,
+                        "package_name": name,
+                        "user_id": user_id,
+                        "camera_profile_id": camera_profile_id,
+                    },
                 )
                 connection.commit()
             except Exception as exc:
@@ -465,6 +520,7 @@ class OracleRepository:
             cursor.execute(
                 """
                 SELECT tp.training_package_id, tp.public_id, tp.package_name,
+                       tp.camera_profile_id,
                        tp.created, tp.first_downloaded_at,
                        creator.display_name AS created_by_name,
                        creator.email AS created_by_email,
@@ -514,7 +570,8 @@ class OracleRepository:
         with self._connection() as connection, connection.cursor() as cursor:
             cursor.execute(
                 """
-                SELECT training_package_id, first_downloaded_at
+                SELECT training_package_id, camera_profile_id,
+                       first_downloaded_at
                   FROM training_packages
                  WHERE public_id = :public_id AND end_date IS NULL
                    FOR UPDATE
@@ -530,7 +587,7 @@ class OracleRepository:
             for image_public_id in dict.fromkeys(image_public_ids):
                 cursor.execute(
                     """
-                    SELECT training_image_id
+                    SELECT training_image_id, camera_profile_id
                       FROM training_images
                      WHERE public_id = :public_id AND end_date IS NULL
                     """,
@@ -540,6 +597,11 @@ class OracleRepository:
                 if value is None:
                     raise NotFoundError(f"Training image not found: {image_public_id}")
                 image_id = int(value[0])
+                image_profile_id = int(value[1])
+                if image_profile_id != int(package["camera_profile_id"]):
+                    raise ConflictError(
+                        "Training image and package use different camera profiles"
+                    )
                 cursor.execute(
                     """
                     SELECT 1 FROM training_package_images

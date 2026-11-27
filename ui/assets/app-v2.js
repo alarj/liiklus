@@ -73,8 +73,10 @@ function bindEvents() {
   elements.dropZone.addEventListener("dragleave", () => elements.dropZone.classList.remove("is-dragging"));
   elements.dropZone.addEventListener("drop", (event) => { event.preventDefault(); elements.dropZone.classList.remove("is-dragging"); selectFile(event.dataTransfer.files[0]); });
   elements.threeLevelsInput.addEventListener("change", () => { elements.confidenceInput.disabled = elements.threeLevelsInput.checked; });
+  elements.detectionAreaInput.addEventListener("change", updateDetectionAreaOverlays);
   elements.crossClassDedupInput.addEventListener("change", updateCrossClassControls);
   elements.crossClassIouInput.addEventListener("change", () => { clearResults(); clearMessage(elements.requestMessage); });
+  elements.profileSelect.addEventListener("change", () => handleProfileChange());
   elements.modelSelect.addEventListener("change", () => { clearResults(); clearMessage(elements.requestMessage); });
   elements.candidateButton.addEventListener("click", () => elements.candidateDialog.showModal());
   elements.cancelCandidateButton.addEventListener("click", () => elements.candidateDialog.close());
@@ -161,8 +163,42 @@ async function loadCurrentUser() {
   state.csrfToken = state.user.csrf_token;
   elements.currentUser.textContent = state.user.display_name || state.user.email;
   renderQuickTags(state.user.training_quick_tags || []);
-  renderModels(state.user.models || [], state.user.default_model);
+  renderProfiles(state.user.camera_profiles || [], state.user.default_camera_profile);
   configureCrossClassDedup();
+}
+
+function renderProfiles(profiles, defaultProfile) {
+  elements.profileSelect.replaceChildren();
+  profiles.forEach((profile) => {
+    const option = document.createElement("option");
+    option.value = profile.code;
+    option.textContent = profile.name;
+    elements.profileSelect.append(option);
+  });
+  elements.profileSelect.value = defaultProfile;
+  handleProfileChange(false);
+}
+
+function selectedProfile() {
+  return (state.user?.camera_profiles || []).find((profile) => profile.code === elements.profileSelect.value) || null;
+}
+
+function profileDefaultConfidence() {
+  return Number(selectedProfile()?.default_confidence ?? DEFAULT_CONFIDENCE);
+}
+
+function handleProfileChange(clear = true) {
+  const profile = selectedProfile();
+  renderModels(profile?.models || [], profile?.default_model || "");
+  elements.confidenceInput.value = "";
+  elements.confidenceInput.placeholder = formatNumber(profileDefaultConfidence(), 2);
+  elements.confidenceHelp.textContent = translate("upload.confidence_help", { defaultConfidence: formatNumber(profileDefaultConfidence(), 2) });
+  elements.detectionAreaInput.checked = true;
+  elements.detectionAreaRow.classList.toggle("hidden", !profileHasDetectionArea(profile));
+  if (clear) {
+    clearResults();
+    clearMessage(elements.requestMessage);
+  }
 }
 
 function renderModels(models, defaultModel) {
@@ -252,6 +288,7 @@ function openFilePicker() { elements.imageInput.click(); }
 function selectFile(file) {
   if (!file) return;
   elements.threeLevelsInput.checked = false;
+  elements.detectionAreaInput.checked = true;
   elements.confidenceInput.disabled = false;
   state.selectedFile = file;
   revokePreviewUrl();
@@ -280,17 +317,18 @@ async function submitImage(event) {
 }
 
 function comparisonLevels() {
-  return [DEFAULT_CONFIDENCE, Math.max(0.01, round2(DEFAULT_CONFIDENCE - 0.20)), Math.max(0.01, round2(DEFAULT_CONFIDENCE - 0.40))];
+  const defaultConfidence = profileDefaultConfidence();
+  return [defaultConfidence, Math.max(0.01, round2(defaultConfidence - 0.20)), Math.max(0.01, round2(defaultConfidence - 0.40))];
 }
 
 function singleLevel() {
   const value = elements.confidenceInput.value.trim();
-  return value === "" ? DEFAULT_CONFIDENCE : Number(value);
+  return value === "" ? profileDefaultConfidence() : Number(value);
 }
 
 async function analyzeAtLevel(level) {
   const body = new FormData(); body.append("file", state.selectedFile, state.selectedFile.name);
-  const query = new URLSearchParams({ conf: String(level), model: elements.modelSelect.value, ...crossClassRequestOptions() });
+  const query = new URLSearchParams({ profile: elements.profileSelect.value, conf: String(level), model: elements.modelSelect.value, ...crossClassRequestOptions() });
   return apiRequest(`/detect/image?${query}`, { method: "POST", body });
 }
 
@@ -305,6 +343,7 @@ function crossClassRequestOptions() {
 function renderResults() {
   const comparison = state.results.length > 1;
   elements.resultModel.textContent = state.results[0]?.model || "—";
+  elements.resultProfile.textContent = state.results[0]?.profile?.name || "—";
   elements.singleResult.classList.toggle("hidden", comparison);
   elements.comparisonTable.classList.toggle("hidden", !comparison);
   elements.differencePanel.classList.toggle("hidden", !comparison);
@@ -320,7 +359,8 @@ function renderSingle(result) {
   Object.entries(result.counts).forEach(([name, count]) => elements.countGrid.append(createCountCard(classLabel(name), count)));
   elements.countGrid.append(createCountCard(translate("results.total"), result.total, true));
   elements.annotatedImage.src = imageDataUrl(result);
-  elements.annotatedImage.onclick = () => openLargeImage(imageDataUrl(result));
+  configureDetectionAreaOverlay(elements.detectionAreaOverlay, result);
+  elements.annotatedImage.onclick = () => openLargeImage(imageDataUrl(result), result);
   elements.resultCaption.textContent = translate("results.caption", { filename: result.filename || "—" });
   elements.resultFilename.textContent = result.filename || "—";
   elements.resultImageSize.textContent = translate("results.image_size_value", result.image_size);
@@ -345,7 +385,7 @@ function renderComparison() {
   head.innerHTML = `<tr><th></th>${state.results.map((result) => `<th>${escapeHtml(translate("results.level", { conf: formatNumber(result.conf, 2) }))}</th>`).join("")}</tr>`;
   table.append(head);
   const body = document.createElement("tbody");
-  ["bus", "car", "tram", "total"].forEach((name) => {
+  [...Object.keys(firstResult?.counts || {}), "total"].forEach((name) => {
     const row = document.createElement("tr");
     const label = name === "total" ? translate("results.total") : classLabel(name);
     row.innerHTML = `<th>${escapeHtml(label)}</th>${state.results.map((result) => `<td>${name === "total" ? result.total : result.counts[name]}</td>`).join("")}`;
@@ -361,8 +401,11 @@ function renderComparison() {
   state.results.forEach((result) => {
     const figure = document.createElement("figure"); const title = document.createElement("figcaption");
     title.textContent = `${translate("results.level", { conf: formatNumber(result.conf, 2) })} · ${result.total}`;
-    const image = document.createElement("img"); image.src = imageDataUrl(result); image.alt = translate("results.image_alt"); image.addEventListener("click", () => openLargeImage(image.src));
-    figure.append(title, image); elements.comparisonImages.append(figure);
+    const visual = document.createElement("div"); visual.className = "result-image-visual";
+    const image = document.createElement("img"); image.src = imageDataUrl(result); image.alt = translate("results.image_alt"); image.addEventListener("click", () => openLargeImage(image.src, result));
+    const overlay = createDetectionAreaOverlay(result);
+    visual.append(image); if (overlay) visual.append(overlay);
+    figure.append(title, visual); elements.comparisonImages.append(figure);
   });
 }
 
@@ -418,7 +461,7 @@ async function saveCandidate(event) {
   event.preventDefault();
   const selectedTags = [...elements.candidateTags.querySelectorAll("input:checked")].map((input) => input.value);
   const reason = elements.candidateReason.value.trim();
-  const body = new FormData(); body.append("file", state.selectedFile, state.selectedFile.name); body.append("reason", reason); body.append("tags", JSON.stringify(selectedTags)); body.append("model", elements.modelSelect.value);
+  const body = new FormData(); body.append("file", state.selectedFile, state.selectedFile.name); body.append("reason", reason); body.append("tags", JSON.stringify(selectedTags)); body.append("profile", elements.profileSelect.value); body.append("model", elements.modelSelect.value);
   Object.entries(crossClassRequestOptions()).forEach(([name, value]) => body.append(name, value));
   try {
     await apiRequest("/training-pool", { method: "POST", body });
@@ -564,12 +607,42 @@ async function deleteCandidate(id) {
 function openJsonDialog() { const values = displayResults(); elements.jsonOutput.textContent = JSON.stringify(values.length === 1 ? values[0] : values, null, 2); elements.jsonDialog.showModal(); }
 function displayResults() { return state.results.map((result) => { const copy = structuredClone(result); if (copy.annotated_image) delete copy.annotated_image.base64; return copy; }); }
 function downloadJson() { const value = state.results.length === 1 ? displayResults()[0] : displayResults(); const url = URL.createObjectURL(new Blob([`${JSON.stringify(value, null, 2)}\n`], { type: "application/json" })); const link = document.createElement("a"); link.href = url; link.download = `${safeFilename(state.selectedFile?.name || "tuvastus")}-tuvastus.json`; link.click(); URL.revokeObjectURL(url); }
-function openLargeImage(src) { elements.largeImage.src = src; elements.imageDialog.showModal(); }
+function openLargeImage(src, result = null) { elements.largeImage.src = src; configureDetectionAreaOverlay(elements.largeDetectionAreaOverlay, result); elements.imageDialog.showModal(); }
 function imageDataUrl(result) { return `data:${result.annotated_image.media_type};base64,${result.annotated_image.base64}`; }
+
+function profileHasDetectionArea(profile) { return Array.isArray(profile?.roi_polygon) && profile.roi_polygon.length >= 3; }
+function resultProfile(result) { return (state.user?.camera_profiles || []).find((profile) => profile.code === result?.profile?.code) || null; }
+function detectionAreaPath(points) {
+  const polygon = points.map(([x, y], index) => `${index === 0 ? "M" : "L"} ${x * 1000} ${y * 1000}`).join(" ");
+  return { outside: `M 0 0 H 1000 V 1000 H 0 Z ${polygon} Z` };
+}
+function configureDetectionAreaOverlay(overlay, result) {
+  const profile = resultProfile(result);
+  if (!profileHasDetectionArea(profile)) { overlay.classList.add("hidden"); return; }
+  const path = detectionAreaPath(profile.roi_polygon);
+  overlay.querySelector(".detection-area-shade").setAttribute("d", path.outside);
+  overlay.querySelector(".detection-area-boundary").setAttribute("points", profile.roi_polygon.map(([x, y]) => `${x * 1000},${y * 1000}`).join(" "));
+  overlay.classList.toggle("hidden", !elements.detectionAreaInput.checked);
+}
+function createDetectionAreaOverlay(result) {
+  if (!profileHasDetectionArea(resultProfile(result))) return null;
+  const namespace = "http://www.w3.org/2000/svg";
+  const overlay = document.createElementNS(namespace, "svg");
+  overlay.setAttribute("viewBox", "0 0 1000 1000"); overlay.setAttribute("preserveAspectRatio", "none"); overlay.setAttribute("aria-hidden", "true"); overlay.classList.add("detection-area-overlay");
+  const shade = document.createElementNS(namespace, "path"); shade.classList.add("detection-area-shade"); shade.setAttribute("fill-rule", "evenodd");
+  const boundary = document.createElementNS(namespace, "polygon"); boundary.classList.add("detection-area-boundary");
+  overlay.append(shade, boundary); configureDetectionAreaOverlay(overlay, result); return overlay;
+}
+function updateDetectionAreaOverlays() { document.querySelectorAll(".detection-area-overlay").forEach((overlay) => overlay.classList.toggle("hidden", !elements.detectionAreaInput.checked)); }
 
 function createCountCard(label, count, total = false) { const card = document.createElement("div"); card.className = `count-card${total ? " is-total" : ""}`; card.innerHTML = `<span class="count-label">${escapeHtml(label)}</span><strong class="count-value">${count}</strong>`; return card; }
 function renderDetections(detections) { elements.detectionsSummary.textContent = translate("detections.summary", { count: detections.length }); elements.detectionsBody.replaceChildren(); detections.forEach((detection) => { const row = document.createElement("tr"); [classLabel(detection.class), formatNumber(detection.confidence, 3), detection.bbox_xyxy.join(", ")].forEach((value) => { const cell = document.createElement("td"); cell.textContent = value; row.append(cell); }); elements.detectionsBody.append(row); }); }
-function classLabel(name) { return translate(`classes.${name}`); }
+function classLabel(name) {
+  const translated = state.translations[`classes.${name}`];
+  if (translated) return translated;
+  const profileClass = selectedProfile()?.classes?.find((item) => item.code === name);
+  return profileClass?.name || name;
+}
 function formatNumber(value, digits) { return new Intl.NumberFormat("et-EE", { maximumFractionDigits: digits }).format(value); }
 function formatDateTime(value) { const date = new Date(value); return Number.isNaN(date.getTime()) ? String(value) : new Intl.DateTimeFormat("et-EE", { dateStyle: "medium", timeStyle: "medium" }).format(date); }
 function formatBytes(bytes) { return bytes < 1024 * 1024 ? `${formatNumber(bytes / 1024, 1)} KiB` : `${formatNumber(bytes / (1024 * 1024), 1)} MiB`; }
@@ -578,7 +651,7 @@ function safeFilename(value) { return value.replace(/\.[^.]+$/, "").replace(/[<>
 function escapeHtml(value) { const div = document.createElement("div"); div.textContent = String(value); return div.innerHTML; }
 function showMessage(element, message, error = false) { element.textContent = message; element.classList.toggle("error", error); }
 function clearMessage(element) { showMessage(element, "", false); }
-function setSubmitting(value) { const activeHistory = state.results.some((result) => result.training_history?.selections?.some((item) => item.file_available)); elements.analyzeButton.disabled = value || !state.selectedFile; elements.replaceButton.disabled = value; elements.threeLevelsInput.disabled = value; elements.crossClassDedupInput.disabled = value; elements.crossClassIouInput.disabled = value || !elements.crossClassDedupInput.checked; elements.modelSelect.disabled = value; elements.confidenceInput.disabled = value || elements.threeLevelsInput.checked; elements.candidateButton.disabled = value || !state.selectedFile || activeHistory; elements.analyzeButton.textContent = translate(value ? "upload.analyzing" : "upload.analyze"); }
+function setSubmitting(value) { const activeHistory = state.results.some((result) => result.training_history?.selections?.some((item) => item.file_available)); elements.analyzeButton.disabled = value || !state.selectedFile; elements.replaceButton.disabled = value; elements.threeLevelsInput.disabled = value; elements.crossClassDedupInput.disabled = value; elements.crossClassIouInput.disabled = value || !elements.crossClassDedupInput.checked; elements.profileSelect.disabled = value; elements.modelSelect.disabled = value; elements.confidenceInput.disabled = value || elements.threeLevelsInput.checked; elements.candidateButton.disabled = value || !state.selectedFile || activeHistory; elements.analyzeButton.textContent = translate(value ? "upload.analyzing" : "upload.analyze"); }
 function clearResults() { state.results = []; elements.resultsCard.classList.add("hidden"); elements.trainingHistory.classList.add("hidden"); elements.comparisonImages.replaceChildren(); }
 function revokePreviewUrl() { if (state.previewUrl) URL.revokeObjectURL(state.previewUrl); state.previewUrl = null; }
 

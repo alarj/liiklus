@@ -72,10 +72,14 @@
           </div>
 
           <div class="analysis-controls">
+            <div class="field-group profile-field">
+              <label for="profileSelect" data-i18n="upload.profile_label"></label>
+              <select id="profileSelect" name="profile"></select>
+            </div>
             <div class="field-group confidence-field">
               <label for="confidenceInput" data-i18n="upload.confidence_label"></label>
               <input id="confidenceInput" name="conf" type="number" min="0.01" max="1" step="0.01" inputmode="decimal" data-i18n-placeholder="upload.confidence_placeholder" />
-              <p class="field-help" data-i18n="upload.confidence_help"></p>
+              <p id="confidenceHelp" class="field-help" data-i18n="upload.confidence_help"></p>
             </div>
             <div class="field-group model-field">
               <label for="modelSelect" data-i18n="upload.model_label"></label>
@@ -88,6 +92,7 @@
             </div>
             <label class="switch-row three-levels-switch" for="threeLevelsInput"><input id="threeLevelsInput" type="checkbox" /><span class="switch-control" aria-hidden="true"></span><span data-i18n="upload.three_levels"></span></label>
           </div>
+          <div id="detectionAreaRow" class="detection-area-row hidden"><label class="switch-row detection-area-switch" for="detectionAreaInput"><input id="detectionAreaInput" type="checkbox" checked /><span class="switch-control" aria-hidden="true"></span><span data-i18n="upload.show_detection_area"></span></label></div>
         </form>
 
         <div id="requestMessage" class="message" role="status" aria-live="polite"></div>
@@ -111,7 +116,10 @@
 
         <figure class="result-figure">
           <div class="preview-frame result-image-frame">
-            <img id="annotatedImage" alt="" data-i18n-alt="results.image_alt" />
+            <div class="result-image-visual">
+              <img id="annotatedImage" alt="" data-i18n-alt="results.image_alt" />
+              <svg id="detectionAreaOverlay" class="detection-area-overlay hidden" viewBox="0 0 1000 1000" preserveAspectRatio="none" aria-hidden="true"><path class="detection-area-shade" fill-rule="evenodd"></path><polygon class="detection-area-boundary"></polygon></svg>
+            </div>
           </div>
           <figcaption id="resultCaption" class="muted"></figcaption>
         </figure>
@@ -119,6 +127,7 @@
         <dl class="metadata-grid">
           <div><dt data-i18n="results.filename"></dt><dd id="resultFilename"></dd></div>
           <div><dt data-i18n="results.image_size"></dt><dd id="resultImageSize"></dd></div>
+          <div><dt data-i18n="results.profile"></dt><dd id="resultProfile"></dd></div>
           <div><dt data-i18n="results.model"></dt><dd id="resultModel"></dd></div>
           <div><dt data-i18n="results.confidence"></dt><dd id="resultConfidence"></dd></div>
           <div><dt data-i18n="results.cross_class_dedup"></dt><dd id="resultCrossClassDedup"></dd></div>
@@ -187,7 +196,7 @@
       </form>
     </dialog>
 
-    <dialog id="imageDialog" class="image-dialog"><button id="closeImageButton" class="secondary-button" type="button" data-i18n="common.close"></button><img id="largeImage" alt="" /></dialog>
+    <dialog id="imageDialog" class="image-dialog"><button id="closeImageButton" class="secondary-button" type="button" data-i18n="common.close"></button><div class="large-image-visual"><img id="largeImage" alt="" /><svg id="largeDetectionAreaOverlay" class="detection-area-overlay hidden" viewBox="0 0 1000 1000" preserveAspectRatio="none" aria-hidden="true"><path class="detection-area-shade" fill-rule="evenodd"></path><polygon class="detection-area-boundary"></polygon></svg></div></dialog>
 
     <dialog id="jsonDialog" class="json-dialog" aria-labelledby="json-title">
       <div class="dialog-heading">

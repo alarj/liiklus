@@ -3,8 +3,8 @@
 ## 1. Dokumendi päritolu
 
 Dokumendi koostas OpenAI Codex 23. novembril 2026 kasutaja lähteülesande ja
-tehniliste otsuste põhjal ning täiendas 24. novembril 2026 mitme mudeli toe
-kirjeldusega.
+tehniliste otsuste põhjal ning täiendas 24. ja 27. novembril 2026 mitme mudeli
+ja andmebaasipõhiste kaameraprofiilide kirjeldusega.
 
 ## 2. Sisukord
 
@@ -43,9 +43,11 @@ Otspunktid:
 
 - Docker koos Compose'i toega.
 - Olemasolev väline Docker-võrk `funo_net`.
-- Mudelifailid `models/best v2.onnx` ja `models/best.onnx`; mudelifaile Git-is
-  ei hoita.
+- Andmebaasi aktiivsetes kaameraprofiilides nimetatud ONNX-mudelifailid;
+  mudelifaile Git-is ei hoita.
 - Oracle'i skeem on loodud skriptiga `db/schema/001_core_schema.sql`.
+- Olemasoleva skeemi uuendamisel tuleb kasutaja loal rakendada
+  `db/schema/002_camera_profiles.sql`.
 - `TRAINING_POOL_DIR` kataloog on API konteineri kasutajale kirjutatav.
 
 Kasutatava mudeli failinimi ja SHA-256 kontrollsumma tagastatakse iga
@@ -90,11 +92,14 @@ Mõlemad tuvastusotspunktid tagastavad UTC-välja `request_received_at`,
 millisekundites `processing_duration_ms`, kliendi antud failinime `filename`,
 tegelikult kasutatud usalduslävendi `conf`, mudeli failinime `model`, mudeli
 kontrollsumma `model_sha256`, pildi mõõdud, klasside loendused ja tuvastused.
-Valikuline query-parameeter `model` valib mudeli failinime järgi; parameetri
-puudumisel kasutatakse `MODEL_FILES_JSON` esimest mudelit.
+Valikuline query-parameeter `profile` valib kaameraprofiili koodi järgi;
+puudumisel kasutatakse andmebaasi aktiivset vaikeprofiili. Valikuline
+`model` valib profiili mudelifaili; puudumisel kasutatakse profiili esimest
+mudelit. Vastuse `profile` objekt näitab tegelikult kasutatud profiili.
 `/api/detect/image` lisab
 objekti `annotated_image`, mille `media_type` on `image/jpeg` ja `base64`
-sisaldab märgendatud JPEG-i. Sisendpilt saadetakse mõlemale otspunktile
+sisaldab tuvastuskastidega JPEG-i. ROI-polügooni ega piirkonna tumendust API
+pildi pikslitesse ei lisata. Sisendpilt saadetakse mõlemale otspunktile
 tavalise `multipart/form-data` failina, mitte Base64-kujul. Ühe päringu jooksul
 käivitatakse mudel üks kord.
 
@@ -104,9 +109,16 @@ kohalikku ajavööndisse.
 
 ## 7. UI kasutamine
 
-UI võimaldab valida `.env` järjestatud nimekirjast mudeli ning analüüsida pilti
-ühe lävendiga või kolme `.env` vaikeväärtusest tuletatud lävendiga. Kolme
-taseme tulemused kuvatakse kõrvuti ja kasutavad sama valitud mudelit.
+UI võimaldab valida aktiivse kaameraprofiili ja selle järjestatud nimekirjast
+mudeli ning analüüsida pilti ühe lävendiga või kolme profiili vaikeväärtusest
+tuletatud lävendiga. Kolme taseme tulemused kuvatakse kõrvuti ja kasutavad
+sama valitud profiili ning mudelit.
+
+Kui profiilis on ROI-polügoon, näitab UI tulemuspildil vaikimisi selle piiri
+punase katkendjoonega ja tumendab veidi polügoonist väljapoole jäävat ala.
+„Näita tuvastuspiirkonda“ lüliti peidab või kuvab mõlemad UI kuvakihid ilma
+uut API päringut tegemata. Uue pildi valimisel lülitub kuvamine uuesti sisse;
+ROI-polügoonita profiili korral lülitit ei näidata.
 
 UI nimetab parameetrit tuvastuslävendiks ja kuvab selgituses API
 vaikeväärtuse. `liiklus-ui` konteiner saab väärtuse Compose'i kaudu samast
@@ -137,8 +149,8 @@ pilt ja YOLO `.txt` salvestatakse `TRAINING_POOL_DIR` kataloogi; metadata ja
 analüüsi JSON salvestatakse Oracle'isse.
 
 Mudelite kataloog ühendatakse konteinerisse kirjutuskaitstult:
-`./models:/app/models:ro`. Kõik `MODEL_FILES_JSON` nimekirjas olevad mudelid
-laaditakse API käivitamisel mällu.
+`./models:/app/models:ro`. Kõik aktiivsetes kaameraprofiilides nimetatud
+unikaalsed mudelid laaditakse API käivitamisel mällu üks kord.
 
 ## 10. Autentimine
 
@@ -151,7 +163,6 @@ sessiooniküpsist. `GET /api/health` jääb avalikuks.
 | Muutuja | Vaikeväärtus | Tähendus |
 | --- | ---: | --- |
 | `MODEL_DIR` | `/app/models` | ONNX-mudelite kataloog konteineris |
-| `MODEL_FILES_JSON` | `["best v2.onnx","best.onnx"]` | Lubatud mudelifailid soovitud järjestuses; esimene on vaikemudel |
 | `ORT_INTRA_OP_NUM_THREADS` | `3` | ONNX Runtime'i operaatorite arvutuslõimed |
 | `MODEL_CONFIDENCE_THRESHOLD` | `0.45` | Mudeli usalduslävendi vaikeväärtus |
 | `MAX_UPLOAD_BYTES` | `5242880` | Pildifaili maksimaalne suurus baitides |

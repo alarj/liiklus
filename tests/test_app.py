@@ -3,8 +3,10 @@ from __future__ import annotations
 import base64
 import os
 import struct
+from decimal import Decimal
 from datetime import datetime
 from io import BytesIO
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import cv2
@@ -21,9 +23,30 @@ class FakeRepository:
     def close(self) -> None:
         pass
 
-    def training_history(self, source_sha256: str) -> None:
-        del source_sha256
+    def training_history(self, source_sha256: str, camera_profile_id: int) -> None:
+        del source_sha256, camera_profile_id
         return None
+
+    def list_camera_profiles(self) -> list[dict[str, object]]:
+        return [
+            {
+                "camera_profile_id": 1,
+                "profile_code": "parnu-mnt-karja",
+                "profile_version": 1,
+                "profile_name": "Pärnu mnt - Karja",
+                "sort_order": 10,
+                "is_default": 1,
+                "source_image_url": None,
+                "model_files_json": ["best.onnx"],
+                "vehicle_classes_json": [
+                    {"model_index": 0, "code": "bus", "name": "Buss"},
+                    {"model_index": 1, "code": "car", "name": "Auto"},
+                    {"model_index": 2, "code": "tram", "name": "Tramm"},
+                ],
+                "roi_mask_json": None,
+                "default_confidence": 0.45,
+            }
+        ]
 
 
 TEST_USER = traffic_app.User(
@@ -72,7 +95,6 @@ def _upload(data: bytes, media_type: str, *, size: int | None = None) -> UploadF
 def _settings() -> traffic_app.Settings:
     return traffic_app.Settings(
         model_dir=traffic_app.Path("/tmp"),
-        model_files=("best.onnx",),
         ort_intra_op_num_threads=3,
         cross_class_dedup_default=1,
         cross_class_iou_threshold=0.80,
@@ -94,11 +116,49 @@ def _settings() -> traffic_app.Settings:
     )
 
 
+def test_camera_profiles_require_exactly_one_default() -> None:
+    rows = FakeRepository().list_camera_profiles()
+    rows[0]["is_default"] = 0
+
+    with pytest.raises(RuntimeError, match="Exactly one active default"):
+        traffic_app._camera_profiles(rows)
+
+
+def test_camera_profile_preserves_model_order() -> None:
+    rows = FakeRepository().list_camera_profiles()
+    rows[0]["model_files_json"] = ["best v3.onnx", "best v2.onnx", "best.onnx"]
+
+    profile = traffic_app._camera_profiles(rows)[0]
+
+    assert profile.default_model == "best v3.onnx"
+    assert profile.model_files == ("best v3.onnx", "best v2.onnx", "best.onnx")
+
+
+def test_camera_profile_accepts_oracle_json_decimal_numbers() -> None:
+    rows = FakeRepository().list_camera_profiles()
+    rows[0]["vehicle_classes_json"][0]["model_index"] = Decimal("0")
+    rows[0]["roi_mask_json"] = {
+        "type": "polygon",
+        "fill_rgb": [Decimal("114"), Decimal("114"), Decimal("114")],
+        "normalized_points": [
+            [Decimal("0"), Decimal("0")],
+            [Decimal("1"), Decimal("0")],
+            [Decimal("1"), Decimal("1")],
+        ],
+    }
+
+    profile = traffic_app._camera_profiles(rows)[0]
+
+    assert profile.vehicle_classes[0].model_index == 0
+    assert profile.roi_mask is not None
+    assert profile.roi_mask.fill_rgb == (114, 114, 114)
+
+
 def test_small_image_is_not_scaled_and_is_padded_right_and_bottom() -> None:
     image = np.full((550, 1150, 3), (10, 20, 30), dtype=np.uint8)
     data = _encode(image, ".png")
 
-    prepared = traffic_app._decode_and_prepare(data, 1150, 550)
+    prepared = traffic_app._decode_and_prepare(data, 1150, 550, 1152, 576, None)
 
     assert (prepared.resized_width, prepared.resized_height) == (1150, 550)
     rgb_tensor = prepared.tensor[0].transpose(1, 2, 0)
@@ -123,7 +183,7 @@ def test_large_image_is_scaled_with_aspect_ratio_and_padded() -> None:
     image = np.full((500, 2000, 3), (10, 20, 30), dtype=np.uint8)
     data = _encode(image, ".jpg")
 
-    prepared = traffic_app._decode_and_prepare(data, 2000, 500)
+    prepared = traffic_app._decode_and_prepare(data, 2000, 500, 1152, 576, None)
 
     assert (prepared.resized_width, prepared.resized_height) == (1152, 288)
     assert prepared.resized_width / prepared.resized_height == pytest.approx(4.0)
@@ -133,6 +193,63 @@ def test_large_image_is_scaled_with_aspect_ratio_and_padded() -> None:
         np.full(3, traffic_app.PADDING_VALUE / 255.0, dtype=np.float32),
         atol=1e-6,
     )
+
+
+def test_roi_mask_keeps_inside_pixel_and_fills_outside_pixel() -> None:
+    image = np.full((100, 200, 3), (10, 20, 30), dtype=np.uint8)
+    roi_mask = traffic_app.RoiMask(
+        normalized_points=((0.25, 0.25), (0.75, 0.25), (0.75, 0.75), (0.25, 0.75)),
+        fill_rgb=(114, 114, 114),
+    )
+
+    masked = traffic_app._apply_roi_mask(image, roi_mask)
+
+    np.testing.assert_array_equal(masked[0, 0], (114, 114, 114))
+    np.testing.assert_array_equal(masked[50, 100], (10, 20, 30))
+
+
+def test_cam_sized_image_is_masked_and_padded_on_one_canvas() -> None:
+    image = np.full((720, 1280, 3), (10, 20, 30), dtype=np.uint8)
+    data = _encode(image, ".png")
+    roi_mask = traffic_app.RoiMask(
+        normalized_points=((0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)),
+        fill_rgb=(114, 114, 114),
+    )
+
+    prepared = traffic_app._decode_and_prepare(
+        data, 1280, 720, 1280, 736, roi_mask
+    )
+
+    assert prepared.tensor.shape == (1, 3, 736, 1280)
+    rgb_tensor = prepared.tensor[0].transpose(1, 2, 0)
+    np.testing.assert_allclose(
+        rgb_tensor[719, 640],
+        np.array([30, 20, 10], dtype=np.float32) / 255.0,
+        atol=1e-6,
+    )
+    np.testing.assert_allclose(
+        rgb_tensor[720, 640],
+        np.full(3, traffic_app.PADDING_VALUE / 255.0, dtype=np.float32),
+        atol=1e-6,
+    )
+
+
+def test_detector_reads_fixed_input_dimensions_from_onnx_shape() -> None:
+    detector = traffic_app.Detector.__new__(traffic_app.Detector)
+    detector.input = SimpleNamespace(shape=[1, 3, 736, 1280])
+
+    detector._validate_model_input()
+
+    assert detector.input_height == 736
+    assert detector.input_width == 1280
+
+
+def test_detector_rejects_dynamic_image_dimensions() -> None:
+    detector = traffic_app.Detector.__new__(traffic_app.Detector)
+    detector.input = SimpleNamespace(shape=[1, 3, "height", "width"])
+
+    with pytest.raises(RuntimeError, match="height and width"):
+        detector._validate_model_input()
 
 
 def test_unsupported_media_type_is_rejected() -> None:
@@ -239,28 +356,16 @@ def test_detection_endpoints_with_synthetic_image(
     data = _encode(image, ".jpg")
     files = {"file": ("blank.jpg", data, "image/jpeg")}
     process_calls = 0
-    default_model = client.app.state.settings.default_model
+    default_model = client.app.state.default_camera_profile.default_model
     default_detector = client.app.state.detectors[default_model]
-    original_process = default_detector.process_bytes
+    original_infer = default_detector.infer
 
-    def counted_process_bytes(
-        image_data: bytes,
-        width: int,
-        height: int,
-        confidence_threshold: float,
-        cross_class_iou_threshold: float | None = None,
-    ) -> traffic_app.ProcessedImage:
+    def counted_infer(tensor: np.ndarray) -> np.ndarray:
         nonlocal process_calls
         process_calls += 1
-        return original_process(
-            image_data,
-            width,
-            height,
-            confidence_threshold,
-            cross_class_iou_threshold,
-        )
+        return original_infer(tensor)
 
-    monkeypatch.setattr(default_detector, "process_bytes", counted_process_bytes)
+    monkeypatch.setattr(default_detector, "infer", counted_infer)
 
     json_response = client.post("/api/detect", files=files)
 
@@ -269,6 +374,11 @@ def test_detection_endpoints_with_synthetic_image(
     payload = json_response.json()
     assert payload["filename"] == "blank.jpg"
     assert payload["conf"] == traffic_app.DEFAULT_MODEL_CONFIDENCE
+    assert payload["profile"] == {
+        "code": "parnu-mnt-karja",
+        "version": 1,
+        "name": "Pärnu mnt - Karja",
+    }
     assert payload["model"] == default_model
     assert payload["cross_class_dedup"] == 1
     assert payload["cross_class_iou_threshold"] == 0.8
@@ -294,6 +404,7 @@ def test_detection_endpoints_with_synthetic_image(
     image_payload = image_response.json()
     assert image_payload["filename"] == "blank.jpg"
     assert image_payload["conf"] == 0.25
+    assert image_payload["profile"] == payload["profile"]
     assert image_payload["model"] == default_model
     assert image_payload["cross_class_dedup"] == 0
     assert "cross_class_iou_threshold" not in image_payload
@@ -318,7 +429,15 @@ def test_detection_endpoints_with_synthetic_image(
         files=files,
     )
 
-    assert invalid_model_response.status_code == 422
+    assert invalid_model_response.status_code == 400
+
+    invalid_profile_response = client.post(
+        "/api/detect?profile=missing",
+        files=files,
+    )
+
+    assert invalid_profile_response.status_code == 400
+    assert "parnu-mnt-karja" in invalid_profile_response.json()["detail"]
 
     invalid_dedup_response = client.post(
         "/api/detect?cross_class_dedup=true",

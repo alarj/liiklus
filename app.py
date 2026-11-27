@@ -18,6 +18,7 @@ import zipfile
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from numbers import Number
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
@@ -57,14 +58,11 @@ def _model_confidence_from_environment() -> float:
     return value
 
 
-MODEL_WIDTH = 1152
-MODEL_HEIGHT = 576
+ANNOTATION_BASE_WIDTH = 1152
 PADDING_VALUE = 114
 NMS_IOU_THRESHOLD = 0.5
 DEFAULT_MODEL_CONFIDENCE = _model_confidence_from_environment()
 ALLOWED_MEDIA_TYPES = {"image/jpeg", "image/png"}
-EXPECTED_CLASSES = {"bus", "car", "tram"}
-EXPORT_CLASS_IDS = {"bus": 0, "car": 1, "tram": 2}
 GOOGLE_TOKENINFO_URL = "https://oauth2.googleapis.com/tokeninfo"
 JPEG_SOF_MARKERS = {
     0xC0,
@@ -103,11 +101,18 @@ class DetectionData(BaseModel):
     detections: list[Detection]
 
 
+class CameraProfileRef(BaseModel):
+    code: str
+    version: int
+    name: str
+
+
 class DetectionResult(DetectionData):
     request_received_at: datetime
     processing_duration_ms: float
     filename: str | None
     conf: float
+    profile: CameraProfileRef
     model: str
     model_sha256: str
     cross_class_dedup: Literal[0, 1]
@@ -137,9 +142,44 @@ class PackageImagesRequest(BaseModel):
 
 
 @dataclass(frozen=True)
+class VehicleClass:
+    model_index: int
+    code: str
+    name: str
+
+
+@dataclass(frozen=True)
+class RoiMask:
+    normalized_points: tuple[tuple[float, float], ...]
+    fill_rgb: tuple[int, int, int]
+
+
+@dataclass(frozen=True)
+class CameraProfile:
+    camera_profile_id: int
+    code: str
+    version: int
+    name: str
+    sort_order: int
+    is_default: bool
+    source_image_url: str | None
+    model_files: tuple[str, ...]
+    vehicle_classes: tuple[VehicleClass, ...]
+    roi_mask: RoiMask | None
+    default_confidence: float
+
+    @property
+    def default_model(self) -> str:
+        return self.model_files[0]
+
+    @property
+    def class_codes(self) -> tuple[str, ...]:
+        return tuple(item.code for item in self.vehicle_classes)
+
+
+@dataclass(frozen=True)
 class Settings:
     model_dir: Path
-    model_files: tuple[str, ...]
     ort_intra_op_num_threads: int
     cross_class_dedup_default: Literal[0, 1]
     cross_class_iou_threshold: float
@@ -157,7 +197,6 @@ class Settings:
     def from_environment(cls) -> Settings:
         return cls(
             model_dir=Path(os.getenv("MODEL_DIR", "/app/models")).resolve(),
-            model_files=_model_files_from_environment(),
             ort_intra_op_num_threads=_positive_int_environment(
                 "ORT_INTRA_OP_NUM_THREADS", 3
             ),
@@ -198,11 +237,6 @@ class Settings:
             google_client_id=os.getenv("GOOGLE_CLIENT_ID", "").strip(),
             session_secret=os.getenv("SESSION_SECRET", "").strip(),
         )
-
-    @property
-    def default_model(self) -> str:
-        return self.model_files[0]
-
 
 @dataclass(frozen=True)
 class PreparedImage:
@@ -291,19 +325,175 @@ def _string_list_environment(name: str, default: tuple[str, ...]) -> tuple[str, 
     return tags
 
 
-def _model_files_from_environment() -> tuple[str, ...]:
-    model_files = _string_list_environment("MODEL_FILES_JSON", ("best.onnx",))
-    for model_file in model_files:
-        path = Path(model_file)
+def _validate_model_filename(model_file: Any, profile_code: str) -> str:
+    if not isinstance(model_file, str) or not model_file.strip():
+        raise RuntimeError(
+            f"Camera profile {profile_code} contains an invalid model filename"
+        )
+    model_file = model_file.strip()
+    path = Path(model_file)
+    if path.name != model_file or path.suffix.lower() != ".onnx" or path.is_absolute():
+        raise RuntimeError(
+            f"Camera profile {profile_code} model filenames must be ONNX filenames "
+            "without paths"
+        )
+    return model_file
+
+
+def _vehicle_classes(raw_value: Any, profile_code: str) -> tuple[VehicleClass, ...]:
+    if not isinstance(raw_value, list) or not raw_value:
+        raise RuntimeError(
+            f"Camera profile {profile_code} vehicle_classes_json must be a non-empty array"
+        )
+    classes: list[VehicleClass] = []
+    for raw_class in raw_value:
+        if not isinstance(raw_class, dict):
+            raise RuntimeError(
+                f"Camera profile {profile_code} contains an invalid vehicle class"
+            )
+        model_index = raw_class.get("model_index")
+        code = raw_class.get("code")
+        name = raw_class.get("name")
         if (
-            path.name != model_file
-            or path.suffix.lower() != ".onnx"
-            or path.is_absolute()
+            isinstance(model_index, bool)
+            or not isinstance(model_index, Number)
+            or not float(model_index).is_integer()
         ):
             raise RuntimeError(
-                "MODEL_FILES_JSON entries must be ONNX filenames without paths"
+                f"Camera profile {profile_code} contains an invalid model_index"
             )
-    return model_files
+        if not isinstance(code, str) or not code.strip():
+            raise RuntimeError(
+                f"Camera profile {profile_code} contains an invalid class code"
+            )
+        if not isinstance(name, str) or not name.strip():
+            raise RuntimeError(
+                f"Camera profile {profile_code} contains an invalid class name"
+            )
+        classes.append(
+            VehicleClass(
+                model_index=int(model_index),
+                code=code.strip(),
+                name=name.strip(),
+            )
+        )
+    classes.sort(key=lambda item: item.model_index)
+    if [item.model_index for item in classes] != list(range(len(classes))):
+        raise RuntimeError(
+            f"Camera profile {profile_code} class indices must start at zero and be consecutive"
+        )
+    codes = [item.code for item in classes]
+    if len(codes) != len(set(codes)):
+        raise RuntimeError(
+            f"Camera profile {profile_code} class codes must be unique"
+        )
+    return tuple(classes)
+
+
+def _roi_mask(raw_value: Any, profile_code: str) -> RoiMask | None:
+    if raw_value is None:
+        return None
+    if not isinstance(raw_value, dict) or raw_value.get("type") != "polygon":
+        raise RuntimeError(
+            f"Camera profile {profile_code} roi_mask_json must be a polygon"
+        )
+    raw_fill = raw_value.get("fill_rgb")
+    if (
+        not isinstance(raw_fill, list)
+        or len(raw_fill) != 3
+        or any(
+            isinstance(value, bool)
+            or not isinstance(value, Number)
+            or not float(value).is_integer()
+            or not 0 <= int(value) <= 255
+            for value in raw_fill
+        )
+    ):
+        raise RuntimeError(
+            f"Camera profile {profile_code} contains an invalid ROI fill color"
+        )
+    raw_points = raw_value.get("normalized_points")
+    if not isinstance(raw_points, list) or len(raw_points) < 3:
+        raise RuntimeError(
+            f"Camera profile {profile_code} ROI polygon must contain at least three points"
+        )
+    points: list[tuple[float, float]] = []
+    for raw_point in raw_points:
+        if not isinstance(raw_point, list) or len(raw_point) != 2:
+            raise RuntimeError(
+                f"Camera profile {profile_code} contains an invalid ROI point"
+            )
+        x, y = raw_point
+        if (
+            isinstance(x, bool)
+            or isinstance(y, bool)
+            or not isinstance(x, Number)
+            or not isinstance(y, Number)
+            or not 0.0 <= float(x) <= 1.0
+            or not 0.0 <= float(y) <= 1.0
+        ):
+            raise RuntimeError(
+                f"Camera profile {profile_code} ROI coordinates must be between zero and one"
+            )
+        points.append((float(x), float(y)))
+    return RoiMask(
+        normalized_points=tuple(points),
+        fill_rgb=tuple(int(value) for value in raw_fill),  # type: ignore[arg-type]
+    )
+
+
+def _camera_profiles(rows: list[dict[str, Any]]) -> tuple[CameraProfile, ...]:
+    profiles: list[CameraProfile] = []
+    for row in rows:
+        code = str(row.get("profile_code") or "").strip()
+        if not code:
+            raise RuntimeError("Camera profile code is required")
+        raw_models = row.get("model_files_json")
+        if not isinstance(raw_models, list) or not raw_models:
+            raise RuntimeError(
+                f"Camera profile {code} model_files_json must be a non-empty array"
+            )
+        model_files = tuple(
+            dict.fromkeys(_validate_model_filename(item, code) for item in raw_models)
+        )
+        version = int(row["profile_version"])
+        if version <= 0:
+            raise RuntimeError(f"Camera profile {code} version must be positive")
+        default_confidence = float(row["default_confidence"])
+        if not 0.01 <= default_confidence <= 1.0:
+            raise RuntimeError(
+                f"Camera profile {code} default confidence must be between 0.01 and 1.0"
+            )
+        profiles.append(
+            CameraProfile(
+                camera_profile_id=int(row["camera_profile_id"]),
+                code=code,
+                version=version,
+                name=str(row.get("profile_name") or "").strip(),
+                sort_order=int(row["sort_order"]),
+                is_default=bool(row["is_default"]),
+                source_image_url=(
+                    str(row["source_image_url"]).strip()
+                    if row.get("source_image_url")
+                    else None
+                ),
+                model_files=model_files,
+                vehicle_classes=_vehicle_classes(
+                    row.get("vehicle_classes_json"), code
+                ),
+                roi_mask=_roi_mask(row.get("roi_mask_json"), code),
+                default_confidence=default_confidence,
+            )
+        )
+    if not profiles:
+        raise RuntimeError("At least one active camera profile is required")
+    codes = [profile.code for profile in profiles]
+    if len(codes) != len(set(codes)):
+        raise RuntimeError("Active camera profile codes must be unique")
+    defaults = [profile for profile in profiles if profile.is_default]
+    if len(defaults) != 1:
+        raise RuntimeError("Exactly one active default camera profile is required")
+    return tuple(profiles)
 
 
 def _sha256(path: Path) -> str:
@@ -314,9 +504,9 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _parse_class_names(raw_names: str | None) -> tuple[str, ...]:
+def _parse_class_names(raw_names: str | None) -> tuple[str, ...] | None:
     if not raw_names:
-        raise RuntimeError("ONNX model metadata does not contain class names")
+        return None
     try:
         parsed = ast.literal_eval(raw_names)
     except (SyntaxError, ValueError) as exc:
@@ -338,8 +528,6 @@ def _parse_class_names(raw_names: str | None) -> tuple[str, ...]:
     if sorted(normalized) != expected_indices:
         raise RuntimeError("ONNX class indices must be consecutive and start at zero")
     names = tuple(normalized[index] for index in expected_indices)
-    if set(names) != EXPECTED_CLASSES or len(names) != len(EXPECTED_CLASSES):
-        raise RuntimeError("ONNX model must contain bus, car and tram classes exactly once")
     return names
 
 
@@ -415,7 +603,43 @@ def _read_upload(file: UploadFile, settings: Settings) -> tuple[bytes, int, int]
     return data, width, height
 
 
-def _decode_and_prepare(data: bytes, expected_width: int, expected_height: int) -> PreparedImage:
+def _roi_polygon(width: int, height: int, roi_mask: RoiMask) -> np.ndarray:
+    return np.asarray(
+        [
+            (
+                min(width - 1, max(0, int(round(x * width)))),
+                min(height - 1, max(0, int(round(y * height)))),
+            )
+            for x, y in roi_mask.normalized_points
+        ],
+        dtype=np.int32,
+    )
+
+
+def _roi_bitmap(width: int, height: int, roi_mask: RoiMask) -> np.ndarray:
+    polygon = _roi_polygon(width, height, roi_mask)
+    polygon_mask = np.zeros((height, width), dtype=np.uint8)
+    cv2.fillPoly(polygon_mask, [polygon], 255)
+    return polygon_mask
+
+
+def _apply_roi_mask(image: np.ndarray, roi_mask: RoiMask) -> np.ndarray:
+    height, width = image.shape[:2]
+    polygon_mask = _roi_bitmap(width, height, roi_mask)
+    fill_bgr = roi_mask.fill_rgb[::-1]
+    masked = np.full_like(image, fill_bgr)
+    cv2.copyTo(image, polygon_mask, masked)
+    return masked
+
+
+def _decode_and_prepare(
+    data: bytes,
+    expected_width: int,
+    expected_height: int,
+    model_width: int,
+    model_height: int,
+    roi_mask: RoiMask | None,
+) -> PreparedImage:
     encoded = np.frombuffer(data, dtype=np.uint8)
     image = cv2.imdecode(encoded, cv2.IMREAD_COLOR)
     if image is None:
@@ -425,26 +649,37 @@ def _decode_and_prepare(data: bytes, expected_width: int, expected_height: int) 
     if (original_width, original_height) != (expected_width, expected_height):
         raise HTTPException(status_code=400, detail="Image dimensions are inconsistent")
 
-    if original_width > MODEL_WIDTH or original_height > MODEL_HEIGHT:
-        scale = min(MODEL_WIDTH / original_width, MODEL_HEIGHT / original_height)
-        resized_width = max(1, min(MODEL_WIDTH, round(original_width * scale)))
-        resized_height = max(1, min(MODEL_HEIGHT, round(original_height * scale)))
+    if original_width > model_width or original_height > model_height:
+        inference_image = _apply_roi_mask(image, roi_mask) if roi_mask else image
+        scale = min(model_width / original_width, model_height / original_height)
+        resized_width = max(1, min(model_width, round(original_width * scale)))
+        resized_height = max(1, min(model_height, round(original_height * scale)))
         resized = cv2.resize(
-            image,
+            inference_image,
             (resized_width, resized_height),
             interpolation=cv2.INTER_AREA,
         )
+        canvas = np.full(
+            (model_height, model_width, 3),
+            PADDING_VALUE,
+            dtype=np.uint8,
+        )
+        canvas[:resized_height, :resized_width] = resized
     else:
-        resized = image
         resized_width = original_width
         resized_height = original_height
-
-    canvas = np.full(
-        (MODEL_HEIGHT, MODEL_WIDTH, 3),
-        PADDING_VALUE,
-        dtype=np.uint8,
-    )
-    canvas[:resized_height, :resized_width] = resized
+        canvas = np.full(
+            (model_height, model_width, 3),
+            PADDING_VALUE,
+            dtype=np.uint8,
+        )
+        target = canvas[:original_height, :original_width]
+        if roi_mask is None:
+            target[:] = image
+        else:
+            target[:] = roi_mask.fill_rgb[::-1]
+            polygon_mask = _roi_bitmap(original_width, original_height, roi_mask)
+            cv2.copyTo(image, polygon_mask, target)
     rgb = cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB)
     tensor = np.ascontiguousarray(rgb.transpose(2, 0, 1), dtype=np.float32)
     tensor = np.expand_dims(tensor / 255.0, axis=0)
@@ -547,7 +782,7 @@ class Detector:
         self.settings = settings
         self.model_name = model_name
         self.model_sha256 = _sha256(model_path)
-        self.class_names = _parse_class_names(
+        self.metadata_class_names = _parse_class_names(
             self.session.get_modelmeta().custom_metadata_map.get("names")
         )
         self.input = self.session.get_inputs()[0]
@@ -557,65 +792,64 @@ class Detector:
 
     def _validate_model_input(self) -> None:
         shape = self.input.shape
-        if len(shape) != 4 or shape[1:] != [3, MODEL_HEIGHT, MODEL_WIDTH]:
-            raise RuntimeError(
-                "ONNX input shape must be [batch, 3, 576, 1152]"
-            )
+        if len(shape) != 4 or shape[1] != 3:
+            raise RuntimeError("ONNX input shape must be [batch, 3, height, width]")
         if isinstance(shape[0], int) and shape[0] != 1:
             raise RuntimeError("ONNX model batch size must be one")
+        if (
+            isinstance(shape[2], bool)
+            or not isinstance(shape[2], int)
+            or shape[2] <= 0
+            or isinstance(shape[3], bool)
+            or not isinstance(shape[3], int)
+            or shape[3] <= 0
+        ):
+            raise RuntimeError("ONNX model height and width must be fixed positive integers")
+        self.input_height = shape[2]
+        self.input_width = shape[3]
 
-    def process(
-        self,
-        file: UploadFile,
-        confidence_threshold: float,
-        cross_class_iou_threshold: float | None = None,
-    ) -> ProcessedImage:
-        data, width, height = _read_upload(file, self.settings)
-        return self.process_bytes(
-            data,
-            width,
-            height,
-            confidence_threshold,
-            cross_class_iou_threshold,
-        )
+    def validate_profile(self, profile: CameraProfile) -> None:
+        if self.model_name not in profile.model_files:
+            raise RuntimeError(
+                f"Camera profile {profile.code} does not contain model {self.model_name}"
+            )
+        if (
+            self.metadata_class_names is not None
+            and self.metadata_class_names != profile.class_codes
+        ):
+            raise RuntimeError(
+                f"Camera profile {profile.code} classes do not match model "
+                f"{self.model_name} metadata"
+            )
 
-    def process_bytes(
-        self,
-        data: bytes,
-        width: int,
-        height: int,
-        confidence_threshold: float,
-        cross_class_iou_threshold: float | None = None,
-    ) -> ProcessedImage:
-        prepared = _decode_and_prepare(data, width, height)
+    def infer(self, tensor: np.ndarray) -> np.ndarray:
         with self._inference_lock:
-            raw_output = self.session.run(
+            return self.session.run(
                 [self.output.name],
-                {self.input.name: prepared.tensor},
+                {self.input.name: tensor},
             )[0]
-        detections = self._postprocess(
+
+    def postprocess(
+        self,
+        raw_output: np.ndarray,
+        prepared: PreparedImage,
+        class_names: tuple[str, ...],
+        confidence_threshold: float,
+        cross_class_iou_threshold: float | None,
+    ) -> list[Detection]:
+        return self._postprocess(
             raw_output,
             prepared,
+            class_names,
             confidence_threshold,
             cross_class_iou_threshold,
-        )
-        counts = {name: 0 for name in self.class_names}
-        for detection in detections:
-            counts[detection.class_name] += 1
-        return ProcessedImage(
-            original=prepared.original,
-            result=DetectionData(
-                image_size=ImageSize(width=width, height=height),
-                counts=counts,
-                total=len(detections),
-                detections=detections,
-            ),
         )
 
     def _postprocess(
         self,
         raw_output: np.ndarray,
         prepared: PreparedImage,
+        class_names: tuple[str, ...],
         confidence_threshold: float,
         cross_class_iou_threshold: float | None,
     ) -> list[Detection]:
@@ -625,7 +859,7 @@ class Detector:
         if predictions.ndim != 2:
             raise RuntimeError("Unsupported ONNX detection output shape")
 
-        feature_count = 4 + len(self.class_names)
+        feature_count = 4 + len(class_names)
         if predictions.shape[0] == feature_count:
             predictions = predictions.T
         elif predictions.shape[1] != feature_count:
@@ -682,7 +916,7 @@ class Detector:
                 continue
             detections.append(
                 Detection(
-                    class_name=self.class_names[int(class_ids[index])],
+                    class_name=class_names[int(class_ids[index])],
                     confidence=round(float(confidences[index]), 6),
                     bbox_xyxy=rounded_box,
                 )
@@ -690,9 +924,48 @@ class Detector:
         return detections
 
 
+def _process_image(
+    detector: Detector,
+    profile: CameraProfile,
+    data: bytes,
+    width: int,
+    height: int,
+    confidence_threshold: float,
+    cross_class_iou_threshold: float | None = None,
+) -> ProcessedImage:
+    prepared = _decode_and_prepare(
+        data,
+        width,
+        height,
+        detector.input_width,
+        detector.input_height,
+        profile.roi_mask,
+    )
+    raw_output = detector.infer(prepared.tensor)
+    detections = detector.postprocess(
+        raw_output,
+        prepared,
+        profile.class_codes,
+        confidence_threshold,
+        cross_class_iou_threshold,
+    )
+    counts = {name: 0 for name in profile.class_codes}
+    for detection in detections:
+        counts[detection.class_name] += 1
+    return ProcessedImage(
+        original=prepared.original,
+        result=DetectionData(
+            image_size=ImageSize(width=width, height=height),
+            counts=counts,
+            total=len(detections),
+            detections=detections,
+        ),
+    )
+
+
 def _annotation_scale(image: np.ndarray) -> float:
     height, width = image.shape[:2]
-    return max(1.0, max(width, height) / MODEL_WIDTH)
+    return max(1.0, max(width, height) / ANNOTATION_BASE_WIDTH)
 
 
 def _annotate(image: np.ndarray, detections: list[Detection]) -> bytes:
@@ -707,10 +980,26 @@ def _annotate(image: np.ndarray, detections: list[Detection]) -> bytes:
         "bus": (60, 180, 75),
         "car": (230, 130, 40),
         "tram": (60, 60, 220),
+        "van-truck": (200, 90, 180),
     }
+    fallback_colors = (
+        (70, 160, 220),
+        (180, 120, 60),
+        (160, 80, 200),
+        (80, 180, 180),
+    )
     for detection in detections:
         x1, y1, x2, y2 = detection.bbox_xyxy
-        color = colors[detection.class_name]
+        color = colors.get(
+            detection.class_name,
+            fallback_colors[
+                sum(
+                    (index + 1) * ord(character)
+                    for index, character in enumerate(detection.class_name)
+                )
+                % len(fallback_colors)
+            ],
+        )
         cv2.rectangle(
             annotated,
             (x1, y1),
@@ -796,6 +1085,7 @@ def _resolve_cross_class_options(
 
 def _detection_result(
     processed: ProcessedImage,
+    profile: CameraProfile,
     request_received_at: datetime,
     processing_duration_ms: float,
     filename: str | None,
@@ -811,6 +1101,11 @@ def _detection_result(
         processing_duration_ms=round(processing_duration_ms, 3),
         filename=_safe_filename(filename),
         conf=confidence_threshold,
+        profile=CameraProfileRef(
+            code=profile.code,
+            version=profile.version,
+            name=profile.name,
+        ),
         model=model_name,
         model_sha256=model_sha256,
         cross_class_dedup=cross_class_dedup,
@@ -832,17 +1127,44 @@ async def lifespan(app: FastAPI):
         raise RuntimeError("GOOGLE_CLIENT_ID is required")
     settings.training_pool_dir.mkdir(parents=True, exist_ok=True)
     app.state.settings = settings
-    app.state.detectors = {
-        model_name: Detector(settings, model_name)
-        for model_name in settings.model_files
-    }
-    app.state.repository = OracleRepository.from_env()
+    repository = OracleRepository.from_env()
+    app.state.repository = repository
     try:
+        profiles = _camera_profiles(repository.list_camera_profiles())
+        model_names = tuple(
+            dict.fromkeys(
+                model_name
+                for profile in profiles
+                for model_name in profile.model_files
+            )
+        )
+        detectors = {
+            model_name: Detector(settings, model_name)
+            for model_name in model_names
+        }
+        for profile in profiles:
+            for model_name in profile.model_files:
+                detectors[model_name].validate_profile(profile)
+        app.state.camera_profiles = profiles
+        app.state.camera_profiles_by_code = {
+            profile.code: profile for profile in profiles
+        }
+        app.state.default_camera_profile = next(
+            profile for profile in profiles if profile.is_default
+        )
+        app.state.detectors = detectors
         yield
     finally:
-        app.state.repository.close()
+        repository.close()
         del app.state.repository
-        del app.state.detectors
+        for state_name in (
+            "camera_profiles",
+            "camera_profiles_by_code",
+            "default_camera_profile",
+            "detectors",
+        ):
+            if hasattr(app.state, state_name):
+                delattr(app.state, state_name)
 
 
 app = FastAPI(
@@ -864,16 +1186,71 @@ app.add_middleware(
 )
 
 
-def _detector(request: Request, model_name: str | None = None) -> Detector:
-    settings: Settings = request.app.state.settings
-    selected_model = model_name or settings.default_model
+def _default_camera_profile(request: Request) -> CameraProfile:
+    return request.app.state.default_camera_profile
+
+
+def _camera_profile(
+    request: Request, profile_code: str | None = None
+) -> CameraProfile:
+    if profile_code is None:
+        return _default_camera_profile(request)
+    try:
+        return request.app.state.camera_profiles_by_code[profile_code]
+    except KeyError as exc:
+        allowed = ", ".join(
+            profile.code for profile in request.app.state.camera_profiles
+        )
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            f"Unknown camera profile: {profile_code}. Allowed profiles: {allowed}",
+        ) from exc
+
+
+def _detector(
+    request: Request,
+    profile: CameraProfile,
+    model_name: str | None = None,
+) -> Detector:
+    selected_model = model_name or profile.default_model
+    if selected_model not in profile.model_files:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            f"Unknown model for camera profile {profile.code}: {selected_model}",
+        )
     try:
         return request.app.state.detectors[selected_model]
     except KeyError as exc:
         raise HTTPException(
-            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status.HTTP_400_BAD_REQUEST,
             f"Unknown model: {selected_model}",
         ) from exc
+
+
+def _camera_profile_payload(profile: CameraProfile) -> dict[str, Any]:
+    return {
+        "code": profile.code,
+        "version": profile.version,
+        "name": profile.name,
+        "sort_order": profile.sort_order,
+        "is_default": profile.is_default,
+        "models": profile.model_files,
+        "default_model": profile.default_model,
+        "classes": [
+            {
+                "model_index": item.model_index,
+                "code": item.code,
+                "name": item.name,
+            }
+            for item in profile.vehicle_classes
+        ],
+        "default_confidence": profile.default_confidence,
+        "roi_polygon": (
+            [list(point) for point in profile.roi_mask.normalized_points]
+            if profile.roi_mask is not None
+            else None
+        ),
+    }
 
 
 def _repository(request: Request) -> OracleRepository:
@@ -972,6 +1349,7 @@ async def google_login(body: GoogleAuthRequest, request: Request) -> dict[str, b
 @app.get("/api/auth/me")
 def auth_me(request: Request, user: Annotated[User, Depends(current_user)]) -> dict[str, Any]:
     settings: Settings = request.app.state.settings
+    profile = _default_camera_profile(request)
     return {
         "public_id": user.public_id,
         "email": user.email,
@@ -979,11 +1357,28 @@ def auth_me(request: Request, user: Annotated[User, Depends(current_user)]) -> d
         "role": user.role_code,
         "csrf_token": _csrf_token(request),
         "training_quick_tags": settings.training_quick_tags,
-        "models": settings.model_files,
-        "default_model": settings.default_model,
+        "camera_profiles": [
+            _camera_profile_payload(item)
+            for item in request.app.state.camera_profiles
+        ],
+        "default_camera_profile": profile.code,
+        "models": profile.model_files,
+        "default_model": profile.default_model,
         "cross_class_dedup_default": settings.cross_class_dedup_default,
         "cross_class_iou_threshold_default": settings.cross_class_iou_threshold,
     }
+
+
+@app.get("/api/camera-profiles")
+def list_camera_profiles(
+    request: Request,
+    user: Annotated[User, Depends(current_user)],
+) -> list[dict[str, Any]]:
+    del user
+    return [
+        _camera_profile_payload(profile)
+        for profile in request.app.state.camera_profiles
+    ]
 
 
 @app.post("/api/auth/logout")
@@ -999,19 +1394,25 @@ def auth_logout(
 def _detect_upload(
     request: Request,
     detector: Detector,
+    profile: CameraProfile,
     file: UploadFile,
     confidence_threshold: float,
     cross_class_iou_threshold: float | None,
 ) -> tuple[ProcessedImage, dict[str, Any] | None]:
     data, width, height = _read_upload(file, detector.settings)
-    processed = detector.process_bytes(
+    processed = _process_image(
+        detector,
+        profile,
         data,
         width,
         height,
         confidence_threshold,
         cross_class_iou_threshold,
     )
-    history = _repository(request).training_history(hashlib.sha256(data).hexdigest())
+    history = _repository(request).training_history(
+        hashlib.sha256(data).hexdigest(),
+        profile.camera_profile_id,
+    )
     return processed, history
 
 
@@ -1025,18 +1426,22 @@ def detect(
     response: Response,
     file: Annotated[UploadFile, File(description="JPEG or PNG image")],
     user: Annotated[User, Depends(current_user)],
+    profile: Annotated[
+        str | None,
+        Query(description="Camera profile code; defaults to the database default profile"),
+    ] = None,
     model: Annotated[
         str | None,
         Query(description="ONNX model filename; defaults to the first configured model"),
     ] = None,
     conf: Annotated[
-        float,
+        float | None,
         Query(
             ge=0.01,
             le=1.0,
             description="Minimum model confidence required for a detection",
         ),
-    ] = DEFAULT_MODEL_CONFIDENCE,
+    ] = None,
     cross_class_dedup: Annotated[
         int | None,
         Query(
@@ -1057,7 +1462,11 @@ def detect(
     del user
     request_received_at = datetime.now(timezone.utc)
     processing_started_at = time.perf_counter()
-    detector = _detector(request, model)
+    selected_profile = _camera_profile(request, profile)
+    detector = _detector(request, selected_profile, model)
+    effective_confidence = (
+        selected_profile.default_confidence if conf is None else conf
+    )
     effective_dedup, effective_cross_class_iou = _resolve_cross_class_options(
         request.app.state.settings,
         cross_class_dedup,
@@ -1066,16 +1475,18 @@ def detect(
     processed, history = _detect_upload(
         request,
         detector,
+        selected_profile,
         file,
-        conf,
+        effective_confidence,
         effective_cross_class_iou,
     )
     result = _detection_result(
         processed,
+        selected_profile,
         request_received_at,
         (time.perf_counter() - processing_started_at) * 1000,
         file.filename,
-        conf,
+        effective_confidence,
         detector.model_name,
         detector.model_sha256,
         effective_dedup,
@@ -1096,18 +1507,22 @@ def detect_image(
     response: Response,
     file: Annotated[UploadFile, File(description="JPEG or PNG image")],
     user: Annotated[User, Depends(current_user)],
+    profile: Annotated[
+        str | None,
+        Query(description="Camera profile code; defaults to the database default profile"),
+    ] = None,
     model: Annotated[
         str | None,
         Query(description="ONNX model filename; defaults to the first configured model"),
     ] = None,
     conf: Annotated[
-        float,
+        float | None,
         Query(
             ge=0.01,
             le=1.0,
             description="Minimum model confidence required for a detection",
         ),
-    ] = DEFAULT_MODEL_CONFIDENCE,
+    ] = None,
     cross_class_dedup: Annotated[
         int | None,
         Query(
@@ -1128,7 +1543,11 @@ def detect_image(
     del user
     request_received_at = datetime.now(timezone.utc)
     processing_started_at = time.perf_counter()
-    detector = _detector(request, model)
+    selected_profile = _camera_profile(request, profile)
+    detector = _detector(request, selected_profile, model)
+    effective_confidence = (
+        selected_profile.default_confidence if conf is None else conf
+    )
     effective_dedup, effective_cross_class_iou = _resolve_cross_class_options(
         request.app.state.settings,
         cross_class_dedup,
@@ -1137,17 +1556,19 @@ def detect_image(
     processed, history = _detect_upload(
         request,
         detector,
+        selected_profile,
         file,
-        conf,
+        effective_confidence,
         effective_cross_class_iou,
     )
     annotated_jpeg = _annotate(processed.original, processed.result.detections)
     result = _detection_result(
         processed,
+        selected_profile,
         request_received_at,
         (time.perf_counter() - processing_started_at) * 1000,
         file.filename,
-        conf,
+        effective_confidence,
         detector.model_name,
         detector.model_sha256,
         effective_dedup,
@@ -1207,9 +1628,12 @@ def _training_filename(public_id: str, original_filename: str, extension: str) -
     return f"{public_id}_{safe_stem or 'image'}{extension}"
 
 
-def _yolo_labels(result: DetectionData) -> str:
+def _yolo_labels(result: DetectionData, profile: CameraProfile) -> str:
     width = result.image_size.width
     height = result.image_size.height
+    export_class_ids = {
+        item.code: item.model_index for item in profile.vehicle_classes
+    }
     lines: list[str] = []
     for detection in result.detections:
         x1, y1, x2, y2 = detection.bbox_xyxy
@@ -1218,7 +1642,7 @@ def _yolo_labels(result: DetectionData) -> str:
         box_width = (x2 - x1) / width
         box_height = (y2 - y1) / height
         lines.append(
-            f"{EXPORT_CLASS_IDS[detection.class_name]} "
+            f"{export_class_ids[detection.class_name]} "
             f"{x_center:.6f} {y_center:.6f} {box_width:.6f} {box_height:.6f}"
         )
     return "\n".join(lines) + ("\n" if lines else "")
@@ -1237,6 +1661,7 @@ def create_training_candidate(
     file: Annotated[UploadFile, File(description="JPEG or PNG image")],
     reason: Annotated[str, Form(max_length=2000)] = "",
     tags: Annotated[str, Form()] = "[]",
+    profile_code: Annotated[str | None, Form(alias="profile")] = None,
     model: Annotated[str | None, Form()] = None,
     cross_class_dedup: Annotated[int | None, Form(ge=0, le=1)] = None,
     cross_class_iou_threshold: Annotated[
@@ -1249,8 +1674,12 @@ def create_training_candidate(
     reason = reason.strip()
     settings: Settings = request.app.state.settings
     source_data, source_width, source_height = _read_upload(file, settings)
+    profile = _camera_profile(request, profile_code)
     source_sha256 = hashlib.sha256(source_data).hexdigest()
-    history = _repository(request).training_history(source_sha256)
+    history = _repository(request).training_history(
+        source_sha256,
+        profile.camera_profile_id,
+    )
     if history and any(item["file_available"] for item in history["selections"]):
         raise HTTPException(status.HTTP_409_CONFLICT, "Image is already a training candidate")
     original_filename = _safe_filename(file.filename) or "image"
@@ -1263,13 +1692,15 @@ def create_training_candidate(
             settings,
         )
     )
-    detector = _detector(request, model)
+    detector = _detector(request, profile, model)
     effective_dedup, effective_cross_class_iou = _resolve_cross_class_options(
         settings,
         cross_class_dedup,
         cross_class_iou_threshold,
     )
-    processed = detector.process_bytes(
+    processed = _process_image(
+        detector,
+        profile,
         stored_data,
         stored_width,
         stored_height,
@@ -1285,13 +1716,16 @@ def create_training_candidate(
     label_temp = label_path.with_name(f".{label_path.name}.tmp")
     try:
         image_temp.write_bytes(stored_data)
-        label_temp.write_text(_yolo_labels(processed.result), encoding="utf-8")
+        label_temp.write_text(
+            _yolo_labels(processed.result, profile), encoding="utf-8"
+        )
         image_temp.replace(image_path)
         label_temp.replace(label_path)
         _repository(request).create_training_image(
             {
                 "public_id": public_id,
                 "candidate_by_user_id": user.user_id,
+                "camera_profile_id": profile.camera_profile_id,
                 "original_filename": original_filename,
                 "image_relative_path": image_relative_path,
                 "label_relative_path": label_relative_path,
@@ -1308,6 +1742,11 @@ def create_training_candidate(
                 "reason": reason or None,
                 "tags_json": _parse_tags(tags),
                 "analysis_json": {
+                    "profile": {
+                        "code": profile.code,
+                        "version": profile.version,
+                        "name": profile.name,
+                    },
                     "conf": settings.training_label_confidence,
                     "model": detector.model_name,
                     "model_sha256": detector.model_sha256,
@@ -1443,7 +1882,11 @@ def create_training_package(
     if not name:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Package name is required")
     try:
-        return _repository(request).create_training_package(name, user.user_id)
+        return _repository(request).create_training_package(
+            name,
+            user.user_id,
+            _default_camera_profile(request).camera_profile_id,
+        )
     except ConflictError as exc:
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
 
