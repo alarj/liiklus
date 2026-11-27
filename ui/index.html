@@ -28,6 +28,7 @@
 
       <nav class="tabs">
         <button id="analysisTab" class="tab is-active" type="button" data-view="analysis" data-i18n="nav.analysis"></button>
+        <button id="liveTab" class="tab" type="button" data-view="live" data-i18n="nav.live"></button>
         <button id="trainingTab" class="tab" type="button" data-view="training"><span data-i18n="nav.training"></span> <span id="trainingCount"></span></button>
       </nav>
 
@@ -160,9 +161,49 @@
 
       </div>
 
+      <div id="liveView" class="hidden">
+        <section class="card" aria-labelledby="live-title">
+          <div class="section-heading">
+            <div><p class="section-kicker" data-i18n="live.kicker"></p><h2 id="live-title" class="visually-hidden" data-i18n="live.title"></h2></div>
+            <span id="liveStatus" class="status-badge" data-i18n="live.stopped"></span>
+          </div>
+          <div class="live-controls">
+            <div class="field-group profile-field"><label for="liveProfileSelect" data-i18n="upload.profile_label"></label><select id="liveProfileSelect"></select></div>
+            <div class="field-group live-interval-field"><label for="liveIntervalInput" data-i18n="live.interval"></label><input id="liveIntervalInput" type="number" min="1" step="1" inputmode="numeric" /></div>
+            <div class="field-group confidence-field"><label for="liveConfidenceInput" data-i18n="upload.confidence_label"></label><input id="liveConfidenceInput" type="number" min="0.01" max="1" step="0.01" inputmode="decimal" /></div>
+            <div class="field-group model-field"><label for="liveModelSelect" data-i18n="upload.model_label"></label><select id="liveModelSelect"></select></div>
+            <div class="live-dedup-controls">
+              <label class="switch-row" for="liveCrossClassDedupInput"><input id="liveCrossClassDedupInput" type="checkbox" /><span class="switch-control" aria-hidden="true"></span><span data-i18n="upload.cross_class_dedup"></span></label>
+              <div id="liveCrossClassThresholdGroup" class="field-group cross-class-threshold-field"><label for="liveCrossClassIouInput" data-i18n="upload.cross_class_iou_label"></label><input id="liveCrossClassIouInput" type="number" min="0.01" max="1" step="0.01" inputmode="decimal" /></div>
+            </div>
+          </div>
+          <div class="live-toolbar">
+            <div id="liveDetectionAreaRow" class="detection-area-row hidden"><label class="switch-row detection-area-switch" for="liveDetectionAreaInput"><input id="liveDetectionAreaInput" type="checkbox" checked /><span class="switch-control" aria-hidden="true"></span><span data-i18n="upload.show_detection_area"></span></label></div>
+            <div class="primary-actions"><button id="liveStartButton" type="button" data-i18n="live.start"></button><button id="liveRefreshButton" class="secondary-button" type="button" data-i18n="live.refresh"></button></div>
+          </div>
+          <div class="live-timing muted"><span><strong data-i18n="live.last_request"></strong> <span id="liveLastRequest">—</span></span><span><strong data-i18n="live.next_request"></strong> <span id="liveNextRequest">—</span></span></div>
+          <div id="liveMessage" class="message" role="status" aria-live="polite"></div>
+        </section>
+
+        <section id="liveResultCard" class="card hidden" aria-labelledby="live-result-title">
+          <div class="section-heading"><div><p class="section-kicker" data-i18n="results.kicker"></p><h2 id="live-result-title" data-i18n="live.result_title"></h2></div><button id="liveCandidateButton" class="secondary-button hidden" type="button" data-i18n="live.send_to_training"></button></div>
+          <div id="liveCountGrid" class="count-grid" data-i18n-aria-label="results.counts_aria"></div>
+          <figure class="result-figure">
+            <div class="preview-frame result-image-frame"><div class="result-image-visual"><img id="liveAnnotatedImage" alt="" data-i18n-alt="results.image_alt" /><svg id="liveDetectionAreaOverlay" class="detection-area-overlay hidden" viewBox="0 0 1000 1000" preserveAspectRatio="none" aria-hidden="true"><path class="detection-area-shade" fill-rule="evenodd"></path><polygon class="detection-area-boundary"></polygon></svg></div></div>
+            <figcaption id="liveResultCaption" class="muted"></figcaption>
+          </figure>
+        </section>
+      </div>
+
       <div id="trainingView" class="hidden">
         <section class="card">
           <div class="section-heading"><div><p class="section-kicker" data-i18n="training.kicker"></p><h2 data-i18n="training.title"></h2></div><span id="trainingTotal" class="status-badge"></span></div>
+          <div class="training-profile-row">
+            <div class="field-group">
+              <label for="trainingProfileSelect" data-i18n="training.profile"></label>
+              <select id="trainingProfileSelect"></select>
+            </div>
+          </div>
           <div class="training-toolbar">
             <form id="trainingFilterForm">
               <input id="trainingFilter" type="search" data-i18n-placeholder="training.filter" />

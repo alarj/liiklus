@@ -26,15 +26,30 @@ FastAPI rakendus loendab JPEG- või PNG-pildilt ONNX-mudeliga busse, autosid
 ja tramme. API tagastab JSON-vastuse; visualiseeringu otspunkt lisab samasse
 vastusesse Base64-kujul tuvastuskastidega JPEG-pildi.
 
+„Kaamerate live view“ laadib URL-iga kaameraprofiili pilti sekundilise
+intervalliga. Backend jätab sama SHA-256 räsiga pildi töötlemata ning saadab
+muutunud pildi olemasolevasse `POST /api/detect/image` teenusesse.
+
 Eraldi `liiklus-ui` konteiner serveerib Google'i sisselogimisega staatilist
 liidest. UI kasutab sama FastAPI JSON API-t tuvastuseks, treeningukandidaatideks
 ja treeningpakkideks.
+
+Roll `USER` saab kasutada pildianalüüsi ja kaamerate live-vaadet ning avab
+pärast sisselogimist vaikimisi live-vaate. Roll `ADMIN` saab lisaks kasutada
+kõiki treeningukandidaatide ja treeningupakkide funktsioone. Treeningu API
+otspunktid kontrollivad `ADMIN` rolli igal päringul Oracle'ist loetud kasutaja
+andmete alusel. Täpne maatriks on failis
+[`docs/rollioigused.md`](docs/rollioigused.md).
 
 Otspunktid:
 
 - `GET /api/health`
 - `POST /api/detect`
 - `POST /api/detect/image`
+- `GET /api/camera-profiles/{profile_code}/live-frame`
+- `POST /api/camera-profiles/{profile_code}/live-viewers/{viewer_id}/pause`
+- `POST /api/camera-profiles/{profile_code}/live-viewers/{viewer_id}/heartbeat`
+- `POST /api/training-pool/live-frame`
 - `/api/training-pool...`
 - `/api/training-packages...`
 - `GET /api/docs`
@@ -47,7 +62,8 @@ Otspunktid:
   mudelifaile Git-is ei hoita.
 - Oracle'i skeem on loodud skriptiga `db/schema/001_core_schema.sql`.
 - Olemasoleva skeemi uuendamisel tuleb kasutaja loal rakendada
-  `db/schema/002_camera_profiles.sql`.
+  `db/schema/002_camera_profiles.sql` ning live-vaate jaoks
+  `db/schema/003_camera_profile_capture_interval.sql`.
 - `TRAINING_POOL_DIR` kataloog on API konteineri kasutajale kirjutatav.
 
 Kasutatava mudeli failinimi ja SHA-256 kontrollsumma tagastatakse iga
@@ -103,6 +119,14 @@ pildi pikslitesse ei lisata. Sisendpilt saadetakse mõlemale otspunktile
 tavalise `multipart/form-data` failina, mitte Base64-kujul. Ühe päringu jooksul
 käivitatakse mudel üks kord.
 
+`GET /api/camera-profiles/{profile_code}/live-frame` laadib profiili
+`source_image_url` pildi ja võrdleb selle SHA-256 räsi `previous_hash`
+parameetriga. Muutumata pildi korral tagastatakse `204 No Content`. Muutunud
+pilt saadetakse sisemiselt muutmata `POST /api/detect/image` lepingusse ning
+vastusele lisatakse lähtepildi `image_sha256`. `viewer_id` seob puhta
+originaali brauserivahekaardi kahe kaadri puhvriga. Sama profiili, räsi ja
+tuvastusseadetega samaaegsed päringud jagavad ühte inferentsi.
+
 Oracle'is on ajatemplite autoriteetne ajavöönd UTC. API märgib kõik Oracle'ist
 loetud ajatemplid JSON-is UTC-na (`+00:00`); UI teisendab need brauseri
 kohalikku ajavööndisse.
@@ -135,6 +159,15 @@ pakki ning paki Roboflow jaoks ZIP-ina alla laadida. Esimene allalaadimine
 lukustab paki koosseisu. Kitsal ekraanil paigutuvad treeninguvaate filtrid,
 pakivalikud ja tegevusnupud üksteise alla.
 
+„Kaamerate live view“ vaates kuvatakse ainult `source_image_url` väärtusega
+profiilid. Positiivse intervalliga seire uuendab annotatsioonipilti
+automaatselt. `NULL` või 0 intervalli korral seire ei käivitu enne, kui kasutaja
+sisestab positiivse täisarvu. ROI kasutab sama brauseripoolset SVG-overlayd
+nagu ühe pildi vaade ja seda saab ilma uue API-päringuta näidata või peita.
+Peatatud seire korral kuvatakse „Saada treeningusse“ nupp. Backend leiab
+ekraanil oleva kaadri räsi järgi puhta originaali; brauser ei saada pilti
+serverile tagasi.
+
 ## 8. Sisendi piirangud
 
 - Lubatud MIME-tüübid: `image/jpeg` ja `image/png`.
@@ -147,6 +180,12 @@ pakivalikud ja tegevusnupud üksteise alla.
 Tavalist tuvastuspilti ei säilitata. Kinnitatud treeningukandidaadi kastideta
 pilt ja YOLO `.txt` salvestatakse `TRAINING_POOL_DIR` kataloogi; metadata ja
 analüüsi JSON salvestatakse Oracle'isse.
+
+Live-vaate puhtaid pilte ja viimase kaadri tuvastustulemusi hoitakse ajutiselt
+API protsessi mälus. Vaatajapõhised lease'id säilitavad pausil oleva kaadri
+treeningusse saatmiseni; aegunud ja viideteta kirjed koristatakse ning cache'i
+mahtu piirab `LIVE_CACHE_MAX_MB`. Püsivalt salvestatakse ainult kasutaja
+kinnitatud treeningukandidaat.
 
 Mudelite kataloog ühendatakse konteinerisse kirjutuskaitstult:
 `./models:/app/models:ro`. Kõik aktiivsetes kaameraprofiilides nimetatud
@@ -167,6 +206,10 @@ sessiooniküpsist. `GET /api/health` jääb avalikuks.
 | `MODEL_CONFIDENCE_THRESHOLD` | `0.45` | Mudeli usalduslävendi vaikeväärtus |
 | `MAX_UPLOAD_BYTES` | `5242880` | Pildifaili maksimaalne suurus baitides |
 | `MAX_IMAGE_PIXELS` | `10000000` | Pildi maksimaalne pikslite arv |
+| `LIVE_CACHE_MAX_MB` | `128` | Live-cache'i maksimaalne mälumaht megabaitides |
+| `LIVE_HOT_CACHE_TTL_SECONDS` | `15` | Viimase tulemuse varu-TTL ja viideteta originaali hot-cache |
+| `LIVE_PAUSE_HEARTBEAT_SECONDS` | `60` | Pausil live-vaate heartbeat'i intervall sekundites |
+| `LIVE_PAUSE_LEASE_SECONDS` | `300` | Pausil kaadri lease sekundites |
 | `TRAINING_POOL_DIR` | `/srv/liiklus/training_pool` | Treeningfailide kataloog |
 | `TRAINING_LABEL_CONFIDENCE` | `0.25` | YOLO eelmärgenduse lävend |
 | `ORACLE_USER`, `ORACLE_PASSWORD`, `ORACLE_DSN` | puudub | Oracle'i ühendus |

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import ast
 import base64
 import csv
@@ -32,6 +33,7 @@ from fastapi import (
     File,
     Form,
     HTTPException,
+    Path as ApiPath,
     Query,
     Request,
     Response,
@@ -129,16 +131,36 @@ class DetectionImageResult(DetectionResult):
     annotated_image: AnnotatedImage
 
 
+class LiveFrameResult(DetectionImageResult):
+    image_sha256: str
+
+
 class GoogleAuthRequest(BaseModel):
     id_token: str
 
 
 class PackageCreateRequest(BaseModel):
     name: str = Field(min_length=1, max_length=250)
+    profile: str | None = None
 
 
 class PackageImagesRequest(BaseModel):
     image_ids: list[str] = Field(min_length=1)
+
+
+class LiveFrameLeaseRequest(BaseModel):
+    image_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class LiveTrainingCandidateRequest(BaseModel):
+    viewer_id: str = Field(min_length=16, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")
+    profile: str = Field(min_length=1, max_length=100)
+    image_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    reason: str = Field(default="", max_length=2000)
+    tags: list[str] = Field(default_factory=list)
+    model: str | None = None
+    cross_class_dedup: Literal[0, 1] | None = None
+    cross_class_iou_threshold: float | None = Field(default=None, ge=0.01, le=1.0)
 
 
 @dataclass(frozen=True)
@@ -163,6 +185,7 @@ class CameraProfile:
     sort_order: int
     is_default: bool
     source_image_url: str | None
+    capture_interval_seconds: int | None
     model_files: tuple[str, ...]
     vehicle_classes: tuple[VehicleClass, ...]
     roi_mask: RoiMask | None
@@ -192,10 +215,14 @@ class Settings:
     training_quick_tags: tuple[str, ...]
     google_client_id: str
     session_secret: str
+    live_cache_max_bytes: int = 128 * 1024 * 1024
+    live_hot_cache_ttl_seconds: int = 15
+    live_pause_heartbeat_seconds: int = 60
+    live_pause_lease_seconds: int = 300
 
     @classmethod
     def from_environment(cls) -> Settings:
-        return cls(
+        settings = cls(
             model_dir=Path(os.getenv("MODEL_DIR", "/app/models")).resolve(),
             ort_intra_op_num_threads=_positive_int_environment(
                 "ORT_INTRA_OP_NUM_THREADS", 3
@@ -236,7 +263,359 @@ class Settings:
             ),
             google_client_id=os.getenv("GOOGLE_CLIENT_ID", "").strip(),
             session_secret=os.getenv("SESSION_SECRET", "").strip(),
+            live_cache_max_bytes=_positive_int_environment(
+                "LIVE_CACHE_MAX_MB", 128
+            ) * 1024 * 1024,
+            live_hot_cache_ttl_seconds=_positive_int_environment(
+                "LIVE_HOT_CACHE_TTL_SECONDS", 15
+            ),
+            live_pause_heartbeat_seconds=_positive_int_environment(
+                "LIVE_PAUSE_HEARTBEAT_SECONDS", 60
+            ),
+            live_pause_lease_seconds=_positive_int_environment(
+                "LIVE_PAUSE_LEASE_SECONDS", 300
+            ),
         )
+        if settings.live_pause_lease_seconds <= settings.live_pause_heartbeat_seconds:
+            raise RuntimeError(
+                "LIVE_PAUSE_LEASE_SECONDS must be greater than "
+                "LIVE_PAUSE_HEARTBEAT_SECONDS"
+            )
+        return settings
+
+
+@dataclass
+class LiveRawFrame:
+    camera_profile_id: int
+    image_sha256: str
+    data: bytes
+    media_type: str
+    filename: str
+    width: int
+    height: int
+    created_at: float
+    last_accessed_at: float
+    hot_expires_at: float
+    reference_count: int = 0
+
+    @property
+    def size_bytes(self) -> int:
+        return len(self.data)
+
+
+@dataclass
+class LiveViewerLease:
+    frame_hashes: list[str]
+    paused: bool
+    expires_at: float
+
+
+@dataclass
+class LiveDetectionCacheEntry:
+    payload: dict[str, Any]
+    size_bytes: int
+    last_accessed_at: float
+    expires_at: float
+
+
+class LiveFrameCache:
+    def __init__(self, settings: Settings) -> None:
+        self.max_bytes = settings.live_cache_max_bytes
+        self.hot_ttl_seconds = settings.live_hot_cache_ttl_seconds
+        self.pause_lease_seconds = settings.live_pause_lease_seconds
+        self._lock = asyncio.Lock()
+        self._frames: dict[tuple[int, str], LiveRawFrame] = {}
+        self._viewers: dict[tuple[int, int, str], LiveViewerLease] = {}
+        self._latest_hash: dict[int, str] = {}
+        self._results: dict[tuple[Any, ...], LiveDetectionCacheEntry] = {}
+        self._fetch_tasks: dict[int, asyncio.Task[tuple[bytes, str, str, int, int]]] = {}
+        self._detection_tasks: dict[tuple[Any, ...], asyncio.Task[dict[str, Any]]] = {}
+        self._total_bytes = 0
+
+    def _remove_result_locked(self, key: tuple[Any, ...]) -> None:
+        entry = self._results.pop(key, None)
+        if entry is not None:
+            self._total_bytes -= entry.size_bytes
+
+    def _remove_frame_locked(self, key: tuple[int, str]) -> None:
+        frame = self._frames.pop(key, None)
+        if frame is not None:
+            self._total_bytes -= frame.size_bytes
+
+    def _release_viewer_locked(self, key: tuple[int, int, str]) -> None:
+        viewer = self._viewers.pop(key, None)
+        if viewer is None:
+            return
+        profile_id = key[1]
+        for image_sha256 in viewer.frame_hashes:
+            frame = self._frames.get((profile_id, image_sha256))
+            if frame is not None:
+                frame.reference_count = max(0, frame.reference_count - 1)
+
+    def _expire_locked(self, now: float) -> None:
+        for key, viewer in list(self._viewers.items()):
+            if viewer.expires_at <= now:
+                self._release_viewer_locked(key)
+        for key, entry in list(self._results.items()):
+            if entry.expires_at <= now:
+                self._remove_result_locked(key)
+        for key, frame in list(self._frames.items()):
+            if frame.reference_count == 0 and frame.hot_expires_at <= now:
+                self._remove_frame_locked(key)
+
+    def _ensure_capacity_locked(self, additional_bytes: int, now: float) -> bool:
+        self._expire_locked(now)
+        if self._total_bytes + additional_bytes <= self.max_bytes:
+            return True
+        for key, _entry in sorted(
+            self._results.items(), key=lambda item: item[1].last_accessed_at
+        ):
+            self._remove_result_locked(key)
+            if self._total_bytes + additional_bytes <= self.max_bytes:
+                return True
+        removable_frames = sorted(
+            (
+                (key, frame)
+                for key, frame in self._frames.items()
+                if (
+                    frame.reference_count == 0
+                    and self._latest_hash.get(frame.camera_profile_id)
+                    != frame.image_sha256
+                )
+            ),
+            key=lambda item: item[1].last_accessed_at,
+        )
+        for key, _frame in removable_frames:
+            self._remove_frame_locked(key)
+            if self._total_bytes + additional_bytes <= self.max_bytes:
+                return True
+        return self._total_bytes + additional_bytes <= self.max_bytes
+
+    async def camera_frame(
+        self,
+        profile: CameraProfile,
+        loader: Any,
+    ) -> LiveRawFrame:
+        async with self._lock:
+            existing = self._fetch_tasks.get(profile.camera_profile_id)
+            if existing is not None and existing.done():
+                self._fetch_tasks.pop(profile.camera_profile_id, None)
+                existing = None
+            if existing is None:
+                existing = asyncio.create_task(loader())
+                self._fetch_tasks[profile.camera_profile_id] = existing
+            task = existing
+        try:
+            data, media_type, filename, width, height = await asyncio.shield(task)
+        finally:
+            if task.done():
+                async with self._lock:
+                    if self._fetch_tasks.get(profile.camera_profile_id) is task:
+                        self._fetch_tasks.pop(profile.camera_profile_id, None)
+
+        image_sha256 = hashlib.sha256(data).hexdigest()
+        now = time.monotonic()
+        frame_key = (profile.camera_profile_id, image_sha256)
+        async with self._lock:
+            self._expire_locked(now)
+            frame = self._frames.get(frame_key)
+            if frame is None:
+                if not self._ensure_capacity_locked(len(data), now):
+                    raise HTTPException(
+                        status.HTTP_503_SERVICE_UNAVAILABLE,
+                        "Live frame cache is full",
+                    )
+                frame = LiveRawFrame(
+                    camera_profile_id=profile.camera_profile_id,
+                    image_sha256=image_sha256,
+                    data=data,
+                    media_type=media_type,
+                    filename=filename,
+                    width=width,
+                    height=height,
+                    created_at=now,
+                    last_accessed_at=now,
+                    hot_expires_at=now + self.hot_ttl_seconds,
+                )
+                self._frames[frame_key] = frame
+                self._total_bytes += frame.size_bytes
+            else:
+                frame.last_accessed_at = now
+                frame.hot_expires_at = now + self.hot_ttl_seconds
+
+            previous_hash = self._latest_hash.get(profile.camera_profile_id)
+            if previous_hash != image_sha256:
+                self._latest_hash[profile.camera_profile_id] = image_sha256
+                for result_key in list(self._results):
+                    if result_key[0] == profile.camera_profile_id:
+                        self._remove_result_locked(result_key)
+            return frame
+
+    async def detection_result(
+        self,
+        profile: CameraProfile,
+        frame: LiveRawFrame,
+        settings_key: tuple[Any, ...],
+        detector_call: Any,
+    ) -> dict[str, Any]:
+        cache_key = (
+            profile.camera_profile_id,
+            frame.image_sha256,
+            *settings_key,
+        )
+        now = time.monotonic()
+        async with self._lock:
+            self._expire_locked(now)
+            cached = self._results.get(cache_key)
+            if cached is not None:
+                cached.last_accessed_at = now
+                cached.expires_at = now + self.hot_ttl_seconds
+                return cached.payload
+            task = self._detection_tasks.get(cache_key)
+            if task is not None and task.done():
+                self._detection_tasks.pop(cache_key, None)
+                task = None
+            if task is None:
+                task = asyncio.create_task(detector_call())
+                self._detection_tasks[cache_key] = task
+        try:
+            payload = await asyncio.shield(task)
+        finally:
+            if task.done():
+                async with self._lock:
+                    if self._detection_tasks.get(cache_key) is task:
+                        self._detection_tasks.pop(cache_key, None)
+
+        now = time.monotonic()
+        async with self._lock:
+            if self._latest_hash.get(profile.camera_profile_id) == frame.image_sha256:
+                existing = self._results.get(cache_key)
+                if existing is None:
+                    size_bytes = len(
+                        json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode(
+                            "utf-8"
+                        )
+                    )
+                    if self._ensure_capacity_locked(size_bytes, now):
+                        self._results[cache_key] = LiveDetectionCacheEntry(
+                            payload=payload,
+                            size_bytes=size_bytes,
+                            last_accessed_at=now,
+                            expires_at=now + self.hot_ttl_seconds,
+                        )
+                        self._total_bytes += size_bytes
+            return payload
+
+    async def record_viewer_frame(
+        self,
+        user_id: int,
+        profile: CameraProfile,
+        viewer_id: str,
+        frame: LiveRawFrame,
+        poll_interval_seconds: int,
+    ) -> None:
+        now = time.monotonic()
+        viewer_key = (user_id, profile.camera_profile_id, viewer_id)
+        frame_key = (profile.camera_profile_id, frame.image_sha256)
+        async with self._lock:
+            self._expire_locked(now)
+            cached_frame = self._frames.get(frame_key)
+            if cached_frame is None:
+                raise HTTPException(status.HTTP_409_CONFLICT, "Live frame is no longer available")
+            old = self._viewers.get(viewer_key)
+            # A request that started before the user pressed Pause may finish
+            # afterwards. It must not turn the pinned viewer lease back into an
+            # active lease or replace the exact frame selected for training.
+            if old is not None and old.paused:
+                return
+            hashes = [] if old is None else list(old.frame_hashes)
+            hashes = [value for value in hashes if value != frame.image_sha256]
+            hashes.append(frame.image_sha256)
+            hashes = hashes[-2:]
+            old_hashes = set() if old is None else set(old.frame_hashes)
+            new_hashes = set(hashes)
+            for image_sha256 in old_hashes - new_hashes:
+                old_frame = self._frames.get((profile.camera_profile_id, image_sha256))
+                if old_frame is not None:
+                    old_frame.reference_count = max(0, old_frame.reference_count - 1)
+            for image_sha256 in new_hashes - old_hashes:
+                new_frame = self._frames.get((profile.camera_profile_id, image_sha256))
+                if new_frame is not None:
+                    new_frame.reference_count += 1
+            self._viewers[viewer_key] = LiveViewerLease(
+                frame_hashes=hashes,
+                paused=False,
+                expires_at=now + max(self.pause_lease_seconds, poll_interval_seconds * 3),
+            )
+
+    async def is_latest(self, profile: CameraProfile, image_sha256: str) -> bool:
+        async with self._lock:
+            return self._latest_hash.get(profile.camera_profile_id) == image_sha256
+
+    async def pause_viewer(
+        self,
+        user_id: int,
+        profile: CameraProfile,
+        viewer_id: str,
+        image_sha256: str,
+    ) -> None:
+        now = time.monotonic()
+        viewer_key = (user_id, profile.camera_profile_id, viewer_id)
+        async with self._lock:
+            self._expire_locked(now)
+            viewer = self._viewers.get(viewer_key)
+            if viewer is None or image_sha256 not in viewer.frame_hashes:
+                raise HTTPException(status.HTTP_409_CONFLICT, "Live frame is no longer available")
+            for old_hash in set(viewer.frame_hashes) - {image_sha256}:
+                old_frame = self._frames.get((profile.camera_profile_id, old_hash))
+                if old_frame is not None:
+                    old_frame.reference_count = max(0, old_frame.reference_count - 1)
+            viewer.frame_hashes = [image_sha256]
+            viewer.paused = True
+            viewer.expires_at = now + self.pause_lease_seconds
+
+    async def heartbeat(
+        self,
+        user_id: int,
+        profile: CameraProfile,
+        viewer_id: str,
+        image_sha256: str,
+    ) -> None:
+        now = time.monotonic()
+        viewer_key = (user_id, profile.camera_profile_id, viewer_id)
+        async with self._lock:
+            self._expire_locked(now)
+            viewer = self._viewers.get(viewer_key)
+            if (
+                viewer is None
+                or not viewer.paused
+                or viewer.frame_hashes != [image_sha256]
+            ):
+                raise HTTPException(status.HTTP_409_CONFLICT, "Paused live frame is no longer available")
+            viewer.expires_at = now + self.pause_lease_seconds
+
+    async def training_frame(
+        self,
+        user_id: int,
+        profile: CameraProfile,
+        viewer_id: str,
+        image_sha256: str,
+    ) -> LiveRawFrame:
+        now = time.monotonic()
+        viewer_key = (user_id, profile.camera_profile_id, viewer_id)
+        async with self._lock:
+            self._expire_locked(now)
+            viewer = self._viewers.get(viewer_key)
+            frame = self._frames.get((profile.camera_profile_id, image_sha256))
+            if (
+                viewer is None
+                or not viewer.paused
+                or image_sha256 not in viewer.frame_hashes
+                or frame is None
+            ):
+                raise HTTPException(status.HTTP_409_CONFLICT, "Live frame is no longer available")
+            frame.last_accessed_at = now
+            return frame
 
 @dataclass(frozen=True)
 class PreparedImage:
@@ -464,6 +843,23 @@ def _camera_profiles(rows: list[dict[str, Any]]) -> tuple[CameraProfile, ...]:
             raise RuntimeError(
                 f"Camera profile {code} default confidence must be between 0.01 and 1.0"
             )
+        raw_capture_interval = row.get("capture_interval_seconds")
+        capture_interval_seconds = (
+            int(raw_capture_interval) if raw_capture_interval is not None else None
+        )
+        if capture_interval_seconds is not None and capture_interval_seconds < 0:
+            raise RuntimeError(
+                f"Camera profile {code} capture interval cannot be negative"
+            )
+        source_image_url = (
+            str(row["source_image_url"]).strip()
+            if row.get("source_image_url")
+            else None
+        )
+        if source_image_url is None and capture_interval_seconds is not None:
+            raise RuntimeError(
+                f"Camera profile {code} cannot have a capture interval without a source image URL"
+            )
         profiles.append(
             CameraProfile(
                 camera_profile_id=int(row["camera_profile_id"]),
@@ -472,11 +868,8 @@ def _camera_profiles(rows: list[dict[str, Any]]) -> tuple[CameraProfile, ...]:
                 name=str(row.get("profile_name") or "").strip(),
                 sort_order=int(row["sort_order"]),
                 is_default=bool(row["is_default"]),
-                source_image_url=(
-                    str(row["source_image_url"]).strip()
-                    if row.get("source_image_url")
-                    else None
-                ),
+                source_image_url=source_image_url,
+                capture_interval_seconds=capture_interval_seconds,
                 model_files=model_files,
                 vehicle_classes=_vehicle_classes(
                     row.get("vehicle_classes_json"), code
@@ -1127,6 +1520,7 @@ async def lifespan(app: FastAPI):
         raise RuntimeError("GOOGLE_CLIENT_ID is required")
     settings.training_pool_dir.mkdir(parents=True, exist_ok=True)
     app.state.settings = settings
+    app.state.live_cache = LiveFrameCache(settings)
     repository = OracleRepository.from_env()
     app.state.repository = repository
     try:
@@ -1162,6 +1556,7 @@ async def lifespan(app: FastAPI):
             "camera_profiles_by_code",
             "default_camera_profile",
             "detectors",
+            "live_cache",
         ):
             if hasattr(app.state, state_name):
                 delattr(app.state, state_name)
@@ -1234,6 +1629,8 @@ def _camera_profile_payload(profile: CameraProfile) -> dict[str, Any]:
         "name": profile.name,
         "sort_order": profile.sort_order,
         "is_default": profile.is_default,
+        "source_image_url": profile.source_image_url,
+        "capture_interval_seconds": profile.capture_interval_seconds,
         "models": profile.model_files,
         "default_model": profile.default_model,
         "classes": [
@@ -1253,8 +1650,20 @@ def _camera_profile_payload(profile: CameraProfile) -> dict[str, Any]:
     }
 
 
+def _camera_profile_reference(profile: CameraProfile) -> dict[str, Any]:
+    return {
+        "code": profile.code,
+        "version": profile.version,
+        "name": profile.name,
+    }
+
+
 def _repository(request: Request) -> OracleRepository:
     return request.app.state.repository
+
+
+def _live_cache(request: Request) -> LiveFrameCache:
+    return request.app.state.live_cache
 
 
 async def current_user(request: Request) -> User:
@@ -1269,6 +1678,14 @@ async def current_user(request: Request) -> User:
     if not user.enabled:
         request.session.clear()
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Account is disabled")
+    return user
+
+
+async def require_admin(
+    user: Annotated[User, Depends(current_user)],
+) -> User:
+    if user.role_code != "ADMIN":
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Administrator access required")
     return user
 
 
@@ -1366,6 +1783,8 @@ def auth_me(request: Request, user: Annotated[User, Depends(current_user)]) -> d
         "default_model": profile.default_model,
         "cross_class_dedup_default": settings.cross_class_dedup_default,
         "cross_class_iou_threshold_default": settings.cross_class_iou_threshold,
+        "live_pause_heartbeat_seconds": settings.live_pause_heartbeat_seconds,
+        "live_pause_lease_seconds": settings.live_pause_lease_seconds,
     }
 
 
@@ -1379,6 +1798,258 @@ def list_camera_profiles(
         _camera_profile_payload(profile)
         for profile in request.app.state.camera_profiles
     ]
+
+
+async def _load_camera_image(
+    profile: CameraProfile,
+    settings: Settings,
+) -> tuple[bytes, str, str, int, int]:
+    if profile.source_image_url is None:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "Camera profile does not have a source image URL",
+        )
+    try:
+        source_url = httpx.URL(profile.source_image_url)
+    except httpx.InvalidURL as exc:
+        raise HTTPException(
+            status.HTTP_502_BAD_GATEWAY,
+            "Camera profile has an invalid source image URL",
+        ) from exc
+    if source_url.scheme not in ("http", "https"):
+        raise HTTPException(
+            status.HTTP_502_BAD_GATEWAY,
+            "Camera profile source image URL must use HTTP or HTTPS",
+        )
+    request_url = source_url.copy_merge_params({"_ts": str(time.time_ns())})
+    try:
+        async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
+            source_response = await client.get(request_url)
+            source_response.raise_for_status()
+    except httpx.HTTPError as exc:
+        raise HTTPException(
+            status.HTTP_502_BAD_GATEWAY,
+            "Camera image is unavailable",
+        ) from exc
+    data = source_response.content
+    if not data or len(data) > settings.max_upload_bytes:
+        raise HTTPException(
+            status.HTTP_502_BAD_GATEWAY,
+            "Camera image size is invalid",
+        )
+    media_type = source_response.headers.get("content-type", "").split(";", 1)[0]
+    if media_type not in ALLOWED_MEDIA_TYPES:
+        raise HTTPException(
+            status.HTTP_502_BAD_GATEWAY,
+            "Camera did not return a JPEG or PNG image",
+        )
+    try:
+        width, height = _encoded_image_dimensions(data, media_type)
+    except HTTPException as exc:
+        raise HTTPException(
+            status.HTTP_502_BAD_GATEWAY,
+            "Camera returned an invalid image",
+        ) from exc
+    if width * height > settings.max_image_pixels:
+        raise HTTPException(
+            status.HTTP_502_BAD_GATEWAY,
+            "Camera image dimensions are invalid",
+        )
+    filename = Path(source_url.path).name or f"{profile.code}.jpg"
+    return data, media_type, filename, width, height
+
+
+async def _detect_live_image(
+    request: Request,
+    data: bytes,
+    media_type: str,
+    filename: str,
+    params: dict[str, str],
+) -> dict[str, Any]:
+    headers = {}
+    if cookie := request.headers.get("cookie"):
+        headers["cookie"] = cookie
+    transport = httpx.ASGITransport(app=request.app)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://liiklus.internal",
+    ) as client:
+        detection_response = await client.post(
+            "/api/detect/image",
+            params=params,
+            files={"file": (filename, data, media_type)},
+            headers=headers,
+        )
+    if detection_response.is_error:
+        try:
+            detail = detection_response.json().get("detail")
+        except (ValueError, AttributeError):
+            detail = None
+        raise HTTPException(
+            detection_response.status_code,
+            detail or "Camera image detection failed",
+        )
+    try:
+        payload = detection_response.json()
+    except ValueError as exc:
+        raise HTTPException(
+            status.HTTP_502_BAD_GATEWAY,
+            "Detection API returned an invalid response",
+        ) from exc
+    if not isinstance(payload, dict):
+        raise HTTPException(
+            status.HTTP_502_BAD_GATEWAY,
+            "Detection API returned an invalid response",
+        )
+    return payload
+
+
+@app.get(
+    "/api/camera-profiles/{profile_code}/live-frame",
+    response_model=LiveFrameResult,
+    response_model_exclude_none=True,
+)
+async def camera_live_frame(
+    profile_code: str,
+    request: Request,
+    response: Response,
+    user: Annotated[User, Depends(current_user)],
+    viewer_id: Annotated[
+        str,
+        Query(min_length=16, max_length=64, pattern=r"^[A-Za-z0-9_-]+$"),
+    ],
+    poll_interval_seconds: Annotated[int, Query(ge=1)],
+    previous_hash: Annotated[
+        str | None,
+        Query(pattern=r"^[0-9a-f]{64}$"),
+    ] = None,
+    model: Annotated[str | None, Query()] = None,
+    conf: Annotated[float | None, Query(ge=0.01, le=1.0)] = None,
+    cross_class_dedup: Annotated[int | None, Query(ge=0, le=1)] = None,
+    cross_class_iou_threshold: Annotated[
+        float | None,
+        Query(ge=0.01, le=1.0),
+    ] = None,
+) -> LiveFrameResult | Response:
+    profile = _camera_profile(request, profile_code)
+    settings: Settings = request.app.state.settings
+    live_cache = _live_cache(request)
+    frame = await live_cache.camera_frame(
+        profile,
+        lambda: _load_camera_image(profile, settings),
+    )
+    if frame.image_sha256 == previous_hash:
+        await live_cache.record_viewer_frame(
+            user.user_id,
+            profile,
+            viewer_id,
+            frame,
+            poll_interval_seconds,
+        )
+        return Response(
+            status_code=status.HTTP_204_NO_CONTENT,
+            headers={"Cache-Control": "no-store"},
+        )
+    selected_model = _detector(request, profile, model).model_name
+    effective_confidence = profile.default_confidence if conf is None else conf
+    effective_dedup, effective_cross_class_iou = _resolve_cross_class_options(
+        settings,
+        cross_class_dedup,
+        cross_class_iou_threshold,
+    )
+    detection_params = {
+        "profile": profile.code,
+        "model": selected_model,
+        "conf": str(effective_confidence),
+        "cross_class_dedup": str(effective_dedup),
+    }
+    if effective_cross_class_iou is not None:
+        detection_params["cross_class_iou_threshold"] = str(
+            effective_cross_class_iou
+        )
+    payload = await live_cache.detection_result(
+        profile,
+        frame,
+        (
+            selected_model,
+            effective_confidence,
+            effective_dedup,
+            effective_cross_class_iou,
+        ),
+        lambda: _detect_live_image(
+            request,
+            frame.data,
+            frame.media_type,
+            frame.filename,
+            detection_params,
+        ),
+    )
+    if not await live_cache.is_latest(profile, frame.image_sha256):
+        return Response(
+            status_code=status.HTTP_204_NO_CONTENT,
+            headers={"Cache-Control": "no-store"},
+        )
+    await live_cache.record_viewer_frame(
+        user.user_id,
+        profile,
+        viewer_id,
+        frame,
+        poll_interval_seconds,
+    )
+    response.headers["Cache-Control"] = "no-store"
+    return LiveFrameResult(**payload, image_sha256=frame.image_sha256)
+
+
+@app.post(
+    "/api/camera-profiles/{profile_code}/live-viewers/{viewer_id}/pause"
+)
+async def pause_live_viewer(
+    profile_code: str,
+    viewer_id: Annotated[
+        str,
+        ApiPath(min_length=16, max_length=64, pattern=r"^[A-Za-z0-9_-]+$"),
+    ],
+    body: LiveFrameLeaseRequest,
+    request: Request,
+    user: Annotated[User, Depends(current_user)],
+) -> dict[str, int]:
+    _verify_csrf(request)
+    profile = _camera_profile(request, profile_code)
+    await _live_cache(request).pause_viewer(
+        user.user_id,
+        profile,
+        viewer_id,
+        body.image_sha256,
+    )
+    settings: Settings = request.app.state.settings
+    return {
+        "heartbeat_seconds": settings.live_pause_heartbeat_seconds,
+        "lease_seconds": settings.live_pause_lease_seconds,
+    }
+
+
+@app.post(
+    "/api/camera-profiles/{profile_code}/live-viewers/{viewer_id}/heartbeat"
+)
+async def heartbeat_live_viewer(
+    profile_code: str,
+    viewer_id: Annotated[
+        str,
+        ApiPath(min_length=16, max_length=64, pattern=r"^[A-Za-z0-9_-]+$"),
+    ],
+    body: LiveFrameLeaseRequest,
+    request: Request,
+    user: Annotated[User, Depends(current_user)],
+) -> dict[str, bool]:
+    _verify_csrf(request)
+    profile = _camera_profile(request, profile_code)
+    await _live_cache(request).heartbeat(
+        user.user_id,
+        profile,
+        viewer_id,
+        body.image_sha256,
+    )
+    return {"ok": True}
 
 
 @app.post("/api/auth/logout")
@@ -1655,26 +2326,23 @@ def _pool_path(settings: Settings, relative_path: str) -> Path:
     return target
 
 
-@app.post("/api/training-pool", status_code=status.HTTP_201_CREATED)
-def create_training_candidate(
+def _create_training_candidate_from_data(
     request: Request,
-    file: Annotated[UploadFile, File(description="JPEG or PNG image")],
-    reason: Annotated[str, Form(max_length=2000)] = "",
-    tags: Annotated[str, Form()] = "[]",
-    profile_code: Annotated[str | None, Form(alias="profile")] = None,
-    model: Annotated[str | None, Form()] = None,
-    cross_class_dedup: Annotated[int | None, Form(ge=0, le=1)] = None,
-    cross_class_iou_threshold: Annotated[
-        float | None,
-        Form(ge=0.01, le=1.0),
-    ] = None,
-    user: User = Depends(current_user),
+    user: User,
+    source_data: bytes,
+    source_media_type: str,
+    source_filename: str,
+    source_width: int,
+    source_height: int,
+    reason: str,
+    tags: list[str],
+    profile: CameraProfile,
+    model: str | None,
+    cross_class_dedup: int | None,
+    cross_class_iou_threshold: float | None,
 ) -> dict[str, Any]:
-    _verify_csrf(request)
     reason = reason.strip()
     settings: Settings = request.app.state.settings
-    source_data, source_width, source_height = _read_upload(file, settings)
-    profile = _camera_profile(request, profile_code)
     source_sha256 = hashlib.sha256(source_data).hexdigest()
     history = _repository(request).training_history(
         source_sha256,
@@ -1682,11 +2350,11 @@ def create_training_candidate(
     )
     if history and any(item["file_available"] for item in history["selections"]):
         raise HTTPException(status.HTTP_409_CONFLICT, "Image is already a training candidate")
-    original_filename = _safe_filename(file.filename) or "image"
+    original_filename = _safe_filename(source_filename) or "image"
     stored_data, stored_media_type, extension, stored_width, stored_height = (
         _prepare_training_image(
             source_data,
-            file.content_type or "",
+            source_media_type,
             source_width,
             source_height,
             settings,
@@ -1729,7 +2397,7 @@ def create_training_candidate(
                 "original_filename": original_filename,
                 "image_relative_path": image_relative_path,
                 "label_relative_path": label_relative_path,
-                "source_media_type": file.content_type,
+                "source_media_type": source_media_type,
                 "stored_media_type": stored_media_type,
                 "source_size_bytes": len(source_data),
                 "stored_size_bytes": len(stored_data),
@@ -1740,7 +2408,7 @@ def create_training_candidate(
                 "source_sha256": source_sha256,
                 "stored_sha256": hashlib.sha256(stored_data).hexdigest(),
                 "reason": reason or None,
-                "tags_json": _parse_tags(tags),
+                "tags_json": list(dict.fromkeys(item.strip() for item in tags if item.strip())),
                 "analysis_json": {
                     "profile": {
                         "code": profile.code,
@@ -1786,20 +2454,91 @@ def create_training_candidate(
     }
 
 
+@app.post("/api/training-pool", status_code=status.HTTP_201_CREATED)
+def create_training_candidate(
+    request: Request,
+    file: Annotated[UploadFile, File(description="JPEG or PNG image")],
+    reason: Annotated[str, Form(max_length=2000)] = "",
+    tags: Annotated[str, Form()] = "[]",
+    profile_code: Annotated[str | None, Form(alias="profile")] = None,
+    model: Annotated[str | None, Form()] = None,
+    cross_class_dedup: Annotated[int | None, Form(ge=0, le=1)] = None,
+    cross_class_iou_threshold: Annotated[
+        float | None,
+        Form(ge=0.01, le=1.0),
+    ] = None,
+    user: User = Depends(require_admin),
+) -> dict[str, Any]:
+    _verify_csrf(request)
+    settings: Settings = request.app.state.settings
+    source_data, source_width, source_height = _read_upload(file, settings)
+    return _create_training_candidate_from_data(
+        request=request,
+        user=user,
+        source_data=source_data,
+        source_media_type=file.content_type or "",
+        source_filename=file.filename or "image",
+        source_width=source_width,
+        source_height=source_height,
+        reason=reason,
+        tags=_parse_tags(tags),
+        profile=_camera_profile(request, profile_code),
+        model=model,
+        cross_class_dedup=cross_class_dedup,
+        cross_class_iou_threshold=cross_class_iou_threshold,
+    )
+
+
+@app.post("/api/training-pool/live-frame", status_code=status.HTTP_201_CREATED)
+async def create_live_training_candidate(
+    body: LiveTrainingCandidateRequest,
+    request: Request,
+    user: Annotated[User, Depends(require_admin)],
+) -> dict[str, Any]:
+    _verify_csrf(request)
+    profile = _camera_profile(request, body.profile)
+    frame = await _live_cache(request).training_frame(
+        user.user_id,
+        profile,
+        body.viewer_id,
+        body.image_sha256,
+    )
+    return await run_in_threadpool(
+        _create_training_candidate_from_data,
+        request=request,
+        user=user,
+        source_data=frame.data,
+        source_media_type=frame.media_type,
+        source_filename=frame.filename,
+        source_width=frame.width,
+        source_height=frame.height,
+        reason=body.reason,
+        tags=body.tags,
+        profile=profile,
+        model=body.model,
+        cross_class_dedup=body.cross_class_dedup,
+        cross_class_iou_threshold=body.cross_class_iou_threshold,
+    )
+
+
 @app.get("/api/training-pool")
 def list_training_candidates(
     request: Request,
-    user: Annotated[User, Depends(current_user)],
+    user: Annotated[User, Depends(require_admin)],
     q: str = "",
     package: str = "",
+    profile: str | None = None,
     limit: Annotated[int, Query(ge=1, le=200)] = 100,
     offset: Annotated[int, Query(ge=0)] = 0,
 ) -> dict[str, Any]:
     del user
+    selected_profile = _camera_profile(request, profile)
     result = _repository(request).list_training_images(
-        q.strip(), limit, offset, package.strip()
+        q.strip(), limit, offset, package.strip(), selected_profile.camera_profile_id
     )
     for item in result["items"]:
+        item.pop("camera_profile_id", None)
+        item["profile"] = _camera_profile_reference(selected_profile)
         item.pop("image_relative_path", None)
         tags = item.pop("tags_json", None) or []
         if isinstance(tags, str):
@@ -1825,7 +2564,7 @@ def list_training_candidates(
 def training_candidate_image(
     image_id: str,
     request: Request,
-    user: Annotated[User, Depends(current_user)],
+    user: Annotated[User, Depends(require_admin)],
     thumbnail: bool = False,
 ) -> Response:
     del user
@@ -1857,7 +2596,7 @@ def training_candidate_image(
 def delete_training_candidate(
     image_id: str,
     request: Request,
-    user: Annotated[User, Depends(current_user)],
+    user: Annotated[User, Depends(require_admin)],
 ) -> Response:
     del user
     _verify_csrf(request)
@@ -1875,17 +2614,18 @@ def delete_training_candidate(
 def create_training_package(
     body: PackageCreateRequest,
     request: Request,
-    user: Annotated[User, Depends(current_user)],
+    user: Annotated[User, Depends(require_admin)],
 ) -> dict[str, Any]:
     _verify_csrf(request)
     name = body.name.strip()
     if not name:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Package name is required")
     try:
+        profile = _camera_profile(request, body.profile)
         return _repository(request).create_training_package(
             name,
             user.user_id,
-            _default_camera_profile(request).camera_profile_id,
+            profile.camera_profile_id,
         )
     except ConflictError as exc:
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
@@ -1893,17 +2633,27 @@ def create_training_package(
 
 @app.get("/api/training-packages")
 def list_training_packages(
-    request: Request, user: Annotated[User, Depends(current_user)]
+    request: Request,
+    user: Annotated[User, Depends(require_admin)],
+    profile: str | None = None,
 ) -> list[dict[str, Any]]:
     del user
-    return _repository(request).list_training_packages()
+    selected_profile = _camera_profile(request, profile)
+    packages = _repository(request).list_training_packages(
+        selected_profile.camera_profile_id
+    )
+    for item in packages:
+        item.pop("camera_profile_id", None)
+        item.pop("training_package_id", None)
+        item["profile"] = _camera_profile_reference(selected_profile)
+    return packages
 
 
 @app.get("/api/training-packages/{package_id}")
 def get_training_package(
     package_id: str,
     request: Request,
-    user: Annotated[User, Depends(current_user)],
+    user: Annotated[User, Depends(require_admin)],
 ) -> dict[str, Any]:
     del user
     try:
@@ -1928,7 +2678,7 @@ def add_training_package_images(
     package_id: str,
     body: PackageImagesRequest,
     request: Request,
-    user: Annotated[User, Depends(current_user)],
+    user: Annotated[User, Depends(require_admin)],
 ) -> dict[str, Any]:
     _verify_csrf(request)
     try:
@@ -1946,7 +2696,7 @@ def remove_training_package_image(
     package_id: str,
     image_id: str,
     request: Request,
-    user: Annotated[User, Depends(current_user)],
+    user: Annotated[User, Depends(require_admin)],
 ) -> Response:
     del user
     _verify_csrf(request)
@@ -1972,7 +2722,7 @@ def _delete_file(path: str) -> None:
 def download_training_package(
     package_id: str,
     request: Request,
-    user: Annotated[User, Depends(current_user)],
+    user: Annotated[User, Depends(require_admin)],
 ) -> FileResponse:
     _verify_csrf(request)
     try:

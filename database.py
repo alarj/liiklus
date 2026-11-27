@@ -195,6 +195,7 @@ class OracleRepository:
                 """
                 SELECT camera_profile_id, profile_code, profile_version,
                        profile_name, sort_order, is_default, source_image_url,
+                       capture_interval_seconds,
                        model_files_json, vehicle_classes_json, roi_mask_json,
                        default_confidence
                   FROM camera_profiles
@@ -319,6 +320,7 @@ class OracleRepository:
         limit: int = 100,
         offset: int = 0,
         package_filter: str = "",
+        camera_profile_id: int | None = None,
     ) -> dict[str, Any]:
         pattern = f"%{search.lower()}%"
         package_mode = (
@@ -327,7 +329,8 @@ class OracleRepository:
         with self._connection() as connection, connection.cursor() as cursor:
             cursor.execute(
                 """
-                SELECT ti.training_image_id, ti.public_id, ti.original_filename,
+                SELECT ti.training_image_id, ti.public_id, ti.camera_profile_id,
+                       ti.original_filename,
                        ti.image_relative_path,
                        ti.reason, ti.tags_json, ti.analysis_json, ti.created,
                        u.display_name AS candidate_by_name,
@@ -340,6 +343,10 @@ class OracleRepository:
                   FROM training_images ti
                   JOIN app_users u ON u.user_id = ti.candidate_by_user_id
                  WHERE ti.end_date IS NULL
+                   AND (
+                       :camera_profile_id IS NULL
+                       OR ti.camera_profile_id = :camera_profile_id
+                   )
                    AND (
                        :search = '' OR
                        LOWER(ti.original_filename) LIKE :pattern OR
@@ -387,6 +394,7 @@ class OracleRepository:
                     "pattern": pattern,
                     "package_mode": package_mode,
                     "package_public_id": package_filter if package_mode == "package" else None,
+                    "camera_profile_id": camera_profile_id,
                     "offset": offset,
                     "limit": limit,
                 },
@@ -551,15 +559,22 @@ class OracleRepository:
             raise NotFoundError("Training package not found")
         return row
 
-    def list_training_packages(self) -> list[dict[str, Any]]:
+    def list_training_packages(
+        self, camera_profile_id: int | None = None
+    ) -> list[dict[str, Any]]:
         with self._connection() as connection, connection.cursor() as cursor:
             cursor.execute(
                 """
                 SELECT tp.public_id
                   FROM training_packages tp
                  WHERE tp.end_date IS NULL
+                   AND (
+                       :camera_profile_id IS NULL
+                       OR tp.camera_profile_id = :camera_profile_id
+                   )
                  ORDER BY tp.created DESC
-                """
+                """,
+                {"camera_profile_id": camera_profile_id},
             )
             ids = [str(value[0]) for value in cursor.fetchall()]
         return [self.get_training_package(public_id) for public_id in ids]

@@ -46,6 +46,7 @@ erDiagram
         NUMBER sort_order
         NUMBER is_default
         VARCHAR2 source_image_url
+        NUMBER capture_interval_seconds
         JSON model_files_json
         JSON vehicle_classes_json
         JSON roi_mask_json
