@@ -134,6 +134,21 @@ select { min-height: 40px; }
 
 .upload-actions { justify-content: flex-end; }
 .analysis-controls { display: flex; align-items: flex-start; gap: 14px; margin-top: 10px; }
+.live-controls {
+  display: grid;
+  grid-template-columns: minmax(175px, 1fr) 130px 155px minmax(155px, .9fr) minmax(345px, auto);
+  align-items: end;
+  gap: 14px;
+}
+.live-controls .field-group { min-width: 0; }
+.live-interval-field { min-width: 0; }
+.live-dedup-controls { display: flex; align-items: flex-end; gap: 14px; min-width: 0; }
+.live-dedup-controls .switch-row { flex: 1 1 auto; min-width: 0; margin-top: 0; line-height: 1.2; white-space: normal; }
+.live-dedup-controls .switch-row > span:last-child { min-width: 0; overflow-wrap: break-word; }
+.live-dedup-controls .cross-class-threshold-field { flex: 0 0 76px; }
+.live-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 14px; margin-top: 10px; }
+.live-toolbar .detection-area-row { margin-top: 0; }
+.live-timing { display: flex; flex-wrap: wrap; gap: 18px; margin-top: 10px; font-size: 13px; }
 .profile-field { flex: 0 0 190px; }
 .confidence-field { flex: 0 0 155px; }
 .model-field { flex: 0 0 155px; }
@@ -205,6 +220,8 @@ th { color: var(--funo-muted); font-size: 13px; }
 .comparison-images figure { min-width: 0; margin: 0; }
 .comparison-images figcaption { margin-bottom: 5px; font-weight: 800; }
 .comparison-images img { display: block; width: 100%; border-radius: 8px; background: #202728; cursor: zoom-in; }
+.training-profile-row { display: flex; margin-bottom: 12px; }
+.training-profile-row .field-group { width: min(360px, 100%); }
 .training-toolbar, .package-toolbar { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
 .training-toolbar form, .package-toolbar form { display: flex; flex: 1 1 420px; gap: 8px; }
 .training-toolbar form input, .package-toolbar form input { flex: 1 1 auto; }
@@ -269,6 +286,8 @@ fieldset { margin: 14px 0; border: 1px solid var(--funo-line); border-radius: 8p
 
 @media (max-width: 1000px) {
   .analysis-controls { flex-wrap: wrap; }
+  .live-controls { grid-template-columns: minmax(180px, 1.5fr) 130px 155px minmax(155px, 1fr); }
+  .live-dedup-controls { grid-column: 1 / -1; }
   .three-levels-switch { margin-left: 0; }
 }
 
@@ -286,12 +305,17 @@ fieldset { margin: 14px 0; border: 1px solid var(--funo-line); border-radius: 8p
   .preview-frame-small { height: 150px; }
   .selection-details { align-items: stretch; flex-direction: column; }
   .analysis-controls { align-items: stretch; flex-direction: column; }
-  .profile-field, .confidence-field, .model-field { flex-basis: auto; width: 100%; }
+  .live-controls { grid-template-columns: 1fr; align-items: stretch; }
+  .live-dedup-controls { grid-column: auto; flex-wrap: wrap; align-items: flex-end; }
+  .profile-field, .confidence-field, .model-field, .live-interval-field { flex-basis: auto; width: 100%; }
   .cross-class-threshold-field { flex-basis: auto; width: 76px; }
   .switch-row { margin-top: 0; }
   .detection-area-row { justify-content: flex-start; }
   .primary-actions, .primary-actions button { width: 100%; }
   .primary-actions { flex-direction: column; }
+  .live-toolbar { align-items: stretch; flex-direction: column; }
+  .live-toolbar .detection-area-row { justify-content: flex-start; }
+  .tabs { flex-wrap: wrap; }
   .site-header, .training-toolbar, .package-toolbar { align-items: stretch; flex-direction: column; }
   .training-toolbar form, .package-toolbar form { flex: none; width: 100%; flex-direction: column; }
   .training-toolbar #trainingPackageFilter, .package-toolbar select { flex: none; width: 100%; }

@@ -37,7 +37,25 @@ const state = {
   candidates: [],
   packages: [],
   selectedCandidateIds: new Set(),
+  candidateSource: "analysis",
+  liveCandidateTarget: null,
   handlingUnauthorized: false,
+  live: {
+    running: false,
+    busy: false,
+    timer: null,
+    countdownTimer: null,
+    nextAt: null,
+    lastHash: null,
+    result: null,
+    sessionCounts: {},
+    sessionTotal: 0,
+    generation: 0,
+    controller: null,
+    viewerId: crypto.randomUUID(),
+    paused: false,
+    heartbeatTimer: null,
+  },
 };
 const elements = {};
 
@@ -78,7 +96,8 @@ function bindEvents() {
   elements.crossClassIouInput.addEventListener("change", () => { clearResults(); clearMessage(elements.requestMessage); });
   elements.profileSelect.addEventListener("change", () => handleProfileChange());
   elements.modelSelect.addEventListener("change", () => { clearResults(); clearMessage(elements.requestMessage); });
-  elements.candidateButton.addEventListener("click", () => elements.candidateDialog.showModal());
+  elements.candidateButton.addEventListener("click", () => openCandidateDialog("analysis"));
+  elements.liveCandidateButton.addEventListener("click", () => openCandidateDialog("live"));
   elements.cancelCandidateButton.addEventListener("click", () => elements.candidateDialog.close());
   elements.candidateForm.addEventListener("submit", saveCandidate);
   elements.viewJsonButton.addEventListener("click", openJsonDialog);
@@ -87,14 +106,22 @@ function bindEvents() {
   elements.closeImageButton.addEventListener("click", () => elements.imageDialog.close());
   elements.logoutButton.addEventListener("click", logout);
   elements.analysisTab.addEventListener("click", () => switchView("analysis"));
+  elements.liveTab.addEventListener("click", () => switchView("live"));
   elements.trainingTab.addEventListener("click", () => switchView("training"));
+  elements.trainingProfileSelect.addEventListener("change", handleTrainingProfileChange);
+  elements.liveProfileSelect.addEventListener("change", handleLiveProfileChange);
+  elements.liveIntervalInput.addEventListener("input", updateLiveButtons);
+  elements.liveCrossClassDedupInput.addEventListener("change", updateLiveCrossClassControls);
+  elements.liveDetectionAreaInput.addEventListener("change", updateLiveDetectionAreaOverlay);
+  elements.liveStartButton.addEventListener("click", toggleLiveMonitoring);
+  elements.liveRefreshButton.addEventListener("click", refreshLiveNow);
   elements.trainingFilterForm.addEventListener("submit", (event) => { event.preventDefault(); loadTrainingData(); });
   elements.trainingPackageFilter.addEventListener("change", loadTrainingData);
   elements.selectAllCandidates.addEventListener("change", toggleAllCandidates);
   elements.packageCreateForm.addEventListener("submit", createPackage);
   elements.addToPackageButton.addEventListener("click", addSelectedToPackage);
   elements.packageSelect.addEventListener("change", () => { updateAddButton(); loadSelectedPackage(); });
-  window.addEventListener("beforeunload", revokePreviewUrl);
+  window.addEventListener("beforeunload", () => { stopLiveTimers(); stopLiveHeartbeat(); revokePreviewUrl(); });
 }
 
 async function loadTranslations() {
@@ -123,11 +150,13 @@ function translate(key, values = {}) {
 }
 
 async function apiRequest(path, options = {}, responseType = "json") {
-  const method = (options.method || "GET").toUpperCase();
-  const headers = { ...(options.headers || {}) };
-  if (!(options.body instanceof FormData) && options.body && !headers["Content-Type"]) headers["Content-Type"] = "application/json";
+  const { silent = false, ...requestOptions } = options;
+  const method = (requestOptions.method || "GET").toUpperCase();
+  const headers = { ...(requestOptions.headers || {}) };
+  if (!(requestOptions.body instanceof FormData) && requestOptions.body && !headers["Content-Type"]) headers["Content-Type"] = "application/json";
   if (state.csrfToken && !["GET", "HEAD"].includes(method)) headers["X-CSRF-Token"] = state.csrfToken;
-  const response = await fetch(`${API_BASE_PATH}${path}`, { ...options, headers, credentials: "same-origin" });
+  const requestFetch = silent ? nativeFetch : window.fetch;
+  const response = await requestFetch(`${API_BASE_PATH}${path}`, { ...requestOptions, headers, credentials: "same-origin" });
   if (response.status === 401 && state.user && path !== "/auth/google") {
     await handleExpiredSession();
     const error = new Error("");
@@ -149,6 +178,8 @@ async function apiRequest(path, options = {}, responseType = "json") {
 async function handleExpiredSession() {
   if (state.handlingUnauthorized) return;
   state.handlingUnauthorized = true;
+  stopLiveMonitoring(false);
+  stopLiveHeartbeat();
   state.user = null;
   state.csrfToken = null;
   try {
@@ -164,7 +195,9 @@ async function loadCurrentUser() {
   elements.currentUser.textContent = state.user.display_name || state.user.email;
   renderQuickTags(state.user.training_quick_tags || []);
   renderProfiles(state.user.camera_profiles || [], state.user.default_camera_profile);
+  renderTrainingProfiles(state.user.camera_profiles || [], state.user.default_camera_profile);
   configureCrossClassDedup();
+  renderLiveProfiles(state.user.camera_profiles || []);
 }
 
 function renderProfiles(profiles, defaultProfile) {
@@ -181,6 +214,17 @@ function renderProfiles(profiles, defaultProfile) {
 
 function selectedProfile() {
   return (state.user?.camera_profiles || []).find((profile) => profile.code === elements.profileSelect.value) || null;
+}
+
+function renderTrainingProfiles(profiles, defaultProfile) {
+  elements.trainingProfileSelect.replaceChildren();
+  profiles.forEach((profile) => {
+    const option = document.createElement("option");
+    option.value = profile.code;
+    option.textContent = profile.name;
+    elements.trainingProfileSelect.append(option);
+  });
+  elements.trainingProfileSelect.value = defaultProfile;
 }
 
 function profileDefaultConfidence() {
@@ -202,14 +246,7 @@ function handleProfileChange(clear = true) {
 }
 
 function renderModels(models, defaultModel) {
-  elements.modelSelect.replaceChildren();
-  models.forEach((model) => {
-    const option = document.createElement("option");
-    option.value = model;
-    option.textContent = model;
-    elements.modelSelect.append(option);
-  });
-  elements.modelSelect.value = defaultModel;
+  renderSelectModels(elements.modelSelect, models, defaultModel);
 }
 
 function configureCrossClassDedup() {
@@ -226,6 +263,307 @@ function updateCrossClassControls(clear = true) {
     clearResults();
     clearMessage(elements.requestMessage);
   }
+}
+
+function renderLiveProfiles(profiles) {
+  const liveProfiles = profiles.filter((profile) => Boolean(profile.source_image_url));
+  elements.liveProfileSelect.replaceChildren();
+  liveProfiles.forEach((profile) => {
+    const option = document.createElement("option");
+    option.value = profile.code;
+    option.textContent = profile.name;
+    elements.liveProfileSelect.append(option);
+  });
+  const available = liveProfiles.length > 0;
+  elements.liveProfileSelect.disabled = !available;
+  elements.liveStartButton.disabled = !available;
+  elements.liveRefreshButton.disabled = !available;
+  if (available) {
+    elements.liveIntervalInput.disabled = false;
+    elements.liveConfidenceInput.disabled = false;
+    elements.liveModelSelect.disabled = false;
+    handleLiveProfileChange();
+  } else {
+    elements.liveMessage.textContent = translate("live.no_profiles");
+    elements.liveIntervalInput.disabled = true;
+    elements.liveConfidenceInput.disabled = true;
+    elements.liveModelSelect.disabled = true;
+  }
+}
+
+function liveSelectedProfile() {
+  return (state.user?.camera_profiles || []).find((profile) => profile.code === elements.liveProfileSelect.value) || null;
+}
+
+function handleLiveProfileChange() {
+  stopLiveMonitoring(false);
+  stopLiveHeartbeat();
+  const profile = liveSelectedProfile();
+  state.live.lastHash = null;
+  state.live.result = null;
+  state.live.paused = false;
+  state.liveCandidateTarget = null;
+  state.live.sessionCounts = Object.fromEntries((profile?.classes || []).map((item) => [item.code, 0]));
+  state.live.sessionTotal = 0;
+  elements.liveIntervalInput.value = profile?.capture_interval_seconds == null ? "" : String(profile.capture_interval_seconds);
+  elements.liveConfidenceInput.value = String(profile?.default_confidence ?? DEFAULT_CONFIDENCE);
+  renderSelectModels(elements.liveModelSelect, profile?.models || [], profile?.default_model || "");
+  elements.liveCrossClassDedupInput.checked = Number(state.user?.cross_class_dedup_default) === 1;
+  elements.liveCrossClassIouInput.value = String(state.user?.cross_class_iou_threshold_default ?? 0.8);
+  updateLiveCrossClassControls();
+  elements.liveDetectionAreaInput.checked = true;
+  elements.liveDetectionAreaRow.classList.toggle("hidden", !profileHasDetectionArea(profile));
+  elements.liveDetectionAreaOverlay.classList.add("hidden");
+  elements.liveAnnotatedImage.removeAttribute("src");
+  elements.liveResultCard.classList.add("hidden");
+  elements.liveLastRequest.textContent = "—";
+  elements.liveNextRequest.textContent = "—";
+  clearMessage(elements.liveMessage);
+  setLiveStatus("live.stopped");
+  updateLiveButtons();
+}
+
+function renderSelectModels(select, models, defaultModel) {
+  select.replaceChildren();
+  models.forEach((model) => {
+    const option = document.createElement("option");
+    option.value = model;
+    option.textContent = model;
+    select.append(option);
+  });
+  select.value = defaultModel;
+}
+
+function updateLiveCrossClassControls() {
+  const enabled = elements.liveCrossClassDedupInput.checked;
+  elements.liveCrossClassThresholdGroup.classList.toggle("hidden", !enabled);
+  elements.liveCrossClassIouInput.disabled = !enabled;
+}
+
+function liveRequestOptions() {
+  if (!elements.liveCrossClassDedupInput.checked) return { cross_class_dedup: "0" };
+  const options = { cross_class_dedup: "1" };
+  const threshold = elements.liveCrossClassIouInput.value.trim();
+  if (threshold) options.cross_class_iou_threshold = threshold;
+  return options;
+}
+
+function startLiveMonitoring() {
+  if (!liveSelectedProfile() || state.live.running || !validLiveInterval()) return;
+  stopLiveTimers();
+  stopLiveHeartbeat();
+  state.live.viewerId = crypto.randomUUID();
+  state.live.paused = false;
+  state.liveCandidateTarget = null;
+  state.live.running = true;
+  state.live.generation += 1;
+  updateLiveButtons();
+  refreshLiveFrame();
+}
+
+async function toggleLiveMonitoring() {
+  if (state.live.running) {
+    stopLiveMonitoring();
+    await pauseLiveFrame();
+  }
+  else startLiveMonitoring();
+}
+
+function stopLiveMonitoring(updateStatus = true) {
+  state.live.running = false;
+  state.live.generation += 1;
+  state.live.controller?.abort();
+  state.live.controller = null;
+  state.live.busy = false;
+  stopLiveTimers();
+  updateLiveButtons();
+  if (updateStatus) setLiveStatus("live.stopped");
+}
+
+function stopLiveTimers() {
+  if (state.live.timer) clearTimeout(state.live.timer);
+  if (state.live.countdownTimer) clearInterval(state.live.countdownTimer);
+  state.live.timer = null;
+  state.live.countdownTimer = null;
+  state.live.nextAt = null;
+  if (elements.liveNextRequest) elements.liveNextRequest.textContent = "—";
+}
+
+function stopLiveHeartbeat() {
+  if (state.live.heartbeatTimer) clearInterval(state.live.heartbeatTimer);
+  state.live.heartbeatTimer = null;
+}
+
+async function pauseLiveFrame() {
+  if (!state.live.result?.image_sha256 || !liveSelectedProfile()) {
+    state.live.paused = false;
+    updateLiveButtons();
+    return;
+  }
+  const profileCode = state.live.result.profile.code;
+  const imageHash = state.live.result.image_sha256;
+  stopLiveHeartbeat();
+  try {
+    const pause = await apiRequest(`/camera-profiles/${encodeURIComponent(profileCode)}/live-viewers/${encodeURIComponent(state.live.viewerId)}/pause`, {
+      method: "POST",
+      body: JSON.stringify({ image_sha256: imageHash }),
+      silent: true,
+    });
+    if (state.live.running || state.live.result?.image_sha256 !== imageHash) return;
+    state.live.paused = true;
+    updateLiveButtons();
+    const heartbeatSeconds = Number(pause.heartbeat_seconds || state.user?.live_pause_heartbeat_seconds || 60);
+    state.live.heartbeatTimer = setInterval(() => renewLivePause(profileCode, imageHash), heartbeatSeconds * 1000);
+  } catch (error) {
+    state.live.paused = false;
+    updateLiveButtons();
+    showMessage(elements.liveMessage, error.message, true);
+  }
+}
+
+async function renewLivePause(profileCode, imageHash) {
+  if (!state.live.paused || state.live.running || state.live.result?.image_sha256 !== imageHash) return;
+  try {
+    await apiRequest(`/camera-profiles/${encodeURIComponent(profileCode)}/live-viewers/${encodeURIComponent(state.live.viewerId)}/heartbeat`, {
+      method: "POST",
+      body: JSON.stringify({ image_sha256: imageHash }),
+      silent: true,
+    });
+  } catch (error) {
+    stopLiveHeartbeat();
+    state.live.paused = false;
+    updateLiveButtons();
+    showMessage(elements.liveMessage, error.message, true);
+  }
+}
+
+function refreshLiveNow() {
+  if (state.live.busy || !liveSelectedProfile()) return;
+  stopLiveTimers();
+  refreshLiveFrame();
+}
+
+async function refreshLiveFrame() {
+  const profile = liveSelectedProfile();
+  if (!profile || state.live.busy) return;
+  const generation = state.live.generation;
+  const controller = new AbortController();
+  state.live.controller = controller;
+  state.live.busy = true;
+  updateLiveButtons();
+  setLiveStatus("live.loading");
+  clearMessage(elements.liveMessage);
+  const query = new URLSearchParams({
+    viewer_id: state.live.viewerId,
+    poll_interval_seconds: elements.liveIntervalInput.value,
+    model: elements.liveModelSelect.value,
+    conf: elements.liveConfidenceInput.value.trim() || String(profile.default_confidence ?? DEFAULT_CONFIDENCE),
+    ...liveRequestOptions(),
+  });
+  if (state.live.lastHash) query.set("previous_hash", state.live.lastHash);
+  try {
+    const result = await apiRequest(`/camera-profiles/${encodeURIComponent(profile.code)}/live-frame?${query}`, {
+      signal: controller.signal,
+      silent: true,
+    });
+    if (generation !== state.live.generation) return;
+    elements.liveLastRequest.textContent = formatDateTime(new Date());
+    if (result === null) {
+      setLiveStatus("live.unchanged");
+    } else {
+      await renderLiveFrame(result, profile, generation);
+      if (generation !== state.live.generation) return;
+      setLiveStatus("live.ready", true);
+    }
+  } catch (error) {
+    if (error.name !== "AbortError" && generation === state.live.generation) {
+      elements.liveLastRequest.textContent = formatDateTime(new Date());
+      setLiveStatus("live.error");
+      showMessage(elements.liveMessage, error.message, true);
+    }
+  } finally {
+    if (state.live.controller === controller) {
+      state.live.controller = null;
+      state.live.busy = false;
+      updateLiveButtons();
+      if (state.live.running && generation === state.live.generation) scheduleNextLiveFrame();
+      else if (!state.live.running && generation === state.live.generation) await pauseLiveFrame();
+    }
+  }
+}
+
+async function renderLiveFrame(result, profile, generation) {
+  const source = imageDataUrl(result);
+  const preload = new Image();
+  preload.src = source;
+  await preload.decode();
+  if (generation !== state.live.generation) return;
+  state.live.lastHash = result.image_sha256;
+  state.live.result = result;
+  state.live.paused = false;
+  state.liveCandidateTarget = null;
+  elements.liveCandidateButton.disabled = false;
+  elements.liveCandidateButton.textContent = translate("live.send_to_training");
+  Object.entries(result.counts || {}).forEach(([name, count]) => {
+    state.live.sessionCounts[name] = (state.live.sessionCounts[name] || 0) + count;
+  });
+  state.live.sessionTotal += result.total || 0;
+  elements.liveAnnotatedImage.src = source;
+  configureDetectionAreaOverlay(elements.liveDetectionAreaOverlay, profile, elements.liveDetectionAreaInput.checked);
+  elements.liveCountGrid.replaceChildren();
+  (profile.classes || []).forEach((item) => {
+    const current = result.counts?.[item.code] || 0;
+    elements.liveCountGrid.append(createCountCard(classLabel(item.code, profile), `${current} (${state.live.sessionCounts[item.code] || 0})`));
+  });
+  elements.liveCountGrid.append(createCountCard(translate("results.total"), `${result.total} (${state.live.sessionTotal})`, true));
+  elements.liveResultCaption.textContent = translate("live.caption", { model: result.model, time: formatDateTime(result.request_received_at) });
+  elements.liveResultCard.classList.remove("hidden");
+}
+
+function scheduleNextLiveFrame() {
+  stopLiveTimers();
+  if (!validLiveInterval()) {
+    state.live.running = false;
+    updateLiveButtons();
+    setLiveStatus("live.interval_required");
+    return;
+  }
+  const seconds = Number(elements.liveIntervalInput.value);
+  state.live.nextAt = Date.now() + seconds * 1000;
+  updateLiveCountdown();
+  state.live.countdownTimer = setInterval(updateLiveCountdown, 250);
+  state.live.timer = setTimeout(() => {
+    stopLiveTimers();
+    refreshLiveFrame();
+  }, seconds * 1000);
+}
+
+function updateLiveCountdown() {
+  if (!state.live.nextAt) return;
+  const seconds = Math.max(0, Math.ceil((state.live.nextAt - Date.now()) / 1000));
+  elements.liveNextRequest.textContent = translate("live.seconds", { seconds });
+}
+
+function updateLiveButtons() {
+  const available = Boolean(liveSelectedProfile());
+  elements.liveStartButton.textContent = translate(state.live.running ? "live.stop" : "live.start");
+  elements.liveStartButton.disabled = state.live.running ? false : !available || !validLiveInterval() || state.live.busy;
+  elements.liveRefreshButton.disabled = !available || state.live.busy;
+  elements.liveCandidateButton.classList.toggle("hidden", !state.live.paused || !state.live.result);
+}
+
+function validLiveInterval() {
+  const value = Number(elements.liveIntervalInput.value);
+  return elements.liveIntervalInput.value.trim() !== "" && Number.isInteger(value) && value > 0;
+}
+
+function setLiveStatus(key, success = false) {
+  elements.liveStatus.textContent = translate(key);
+  elements.liveStatus.classList.toggle("is-success", success);
+}
+
+function updateLiveDetectionAreaOverlay() {
+  configureDetectionAreaOverlay(elements.liveDetectionAreaOverlay, liveSelectedProfile(), elements.liveDetectionAreaInput.checked);
 }
 
 async function showLogin() {
@@ -273,6 +611,8 @@ function showApplication() {
 }
 
 async function logout() {
+  stopLiveMonitoring(false);
+  stopLiveHeartbeat();
   await apiRequest("/auth/logout", { method: "POST" });
   state.user = null; state.csrfToken = null;
   await showLogin();
@@ -359,7 +699,7 @@ function renderSingle(result) {
   Object.entries(result.counts).forEach(([name, count]) => elements.countGrid.append(createCountCard(classLabel(name), count)));
   elements.countGrid.append(createCountCard(translate("results.total"), result.total, true));
   elements.annotatedImage.src = imageDataUrl(result);
-  configureDetectionAreaOverlay(elements.detectionAreaOverlay, result);
+  configureDetectionAreaOverlay(elements.detectionAreaOverlay, resultProfile(result), elements.detectionAreaInput.checked);
   elements.annotatedImage.onclick = () => openLargeImage(imageDataUrl(result), result);
   elements.resultCaption.textContent = translate("results.caption", { filename: result.filename || "—" });
   elements.resultFilename.textContent = result.filename || "—";
@@ -457,10 +797,42 @@ function renderQuickTags(tags) {
   tags.forEach((tag) => { const label = document.createElement("label"); label.className = "tag-choice"; const input = document.createElement("input"); input.type = "checkbox"; input.value = tag; label.append(input, document.createTextNode(tag)); elements.candidateTags.append(label); });
 }
 
+function openCandidateDialog(source) {
+  state.candidateSource = source;
+  state.liveCandidateTarget = null;
+  elements.candidateForm.reset();
+  if (source === "live") {
+    if (!state.live.paused || !state.live.result?.image_sha256) return;
+    state.liveCandidateTarget = {
+      viewer_id: state.live.viewerId,
+      profile: state.live.result.profile.code,
+      image_sha256: state.live.result.image_sha256,
+      model: state.live.result.model,
+      cross_class_dedup: state.live.result.cross_class_dedup,
+      cross_class_iou_threshold: state.live.result.cross_class_iou_threshold,
+    };
+  }
+  elements.candidateDialog.showModal();
+}
+
 async function saveCandidate(event) {
   event.preventDefault();
   const selectedTags = [...elements.candidateTags.querySelectorAll("input:checked")].map((input) => input.value);
   const reason = elements.candidateReason.value.trim();
+  if (state.candidateSource === "live") {
+    if (!state.liveCandidateTarget) return;
+    const body = { ...state.liveCandidateTarget, reason, tags: selectedTags };
+    if (body.cross_class_iou_threshold == null) delete body.cross_class_iou_threshold;
+    try {
+      await apiRequest("/training-pool/live-frame", { method: "POST", body: JSON.stringify(body) });
+      elements.candidateDialog.close(); elements.candidateForm.reset();
+      elements.liveCandidateButton.disabled = true;
+      elements.liveCandidateButton.textContent = translate("candidate.already");
+      showMessage(elements.liveMessage, translate("live.training_saved"));
+      refreshTrainingCount();
+    } catch (error) { showMessage(elements.liveMessage, error.message, true); }
+    return;
+  }
   const body = new FormData(); body.append("file", state.selectedFile, state.selectedFile.name); body.append("reason", reason); body.append("tags", JSON.stringify(selectedTags)); body.append("profile", elements.profileSelect.value); body.append("model", elements.modelSelect.value);
   Object.entries(crossClassRequestOptions()).forEach(([name, value]) => body.append(name, value));
   try {
@@ -472,23 +844,40 @@ async function saveCandidate(event) {
 }
 
 function switchView(view) {
+  const analysis = view === "analysis";
+  const live = view === "live";
   const training = view === "training";
-  elements.analysisView.classList.toggle("hidden", training); elements.trainingView.classList.toggle("hidden", !training);
-  elements.analysisTab.classList.toggle("is-active", !training); elements.trainingTab.classList.toggle("is-active", training);
+  if (!live && state.live.running) stopLiveMonitoring();
+  elements.analysisView.classList.toggle("hidden", !analysis);
+  elements.liveView.classList.toggle("hidden", !live);
+  elements.trainingView.classList.toggle("hidden", !training);
+  elements.analysisTab.classList.toggle("is-active", analysis);
+  elements.liveTab.classList.toggle("is-active", live);
+  elements.trainingTab.classList.toggle("is-active", training);
   if (training) loadTrainingData();
 }
 
 async function refreshTrainingCount() {
-  try { const data = await apiRequest("/training-pool?limit=1"); elements.trainingCount.textContent = `(${data.total})`; }
+  const profile = elements.trainingProfileSelect.value || state.user?.default_camera_profile || "";
+  try { const data = await apiRequest(`/training-pool?profile=${encodeURIComponent(profile)}&limit=1`); elements.trainingCount.textContent = `(${data.total})`; }
   catch (_) { elements.trainingCount.textContent = ""; }
+}
+
+function handleTrainingProfileChange() {
+  elements.trainingPackageFilter.value = "";
+  elements.packageSelect.value = "";
+  elements.packageContents.classList.add("hidden");
+  loadTrainingData();
 }
 
 async function loadTrainingData() {
   try {
     const query = encodeURIComponent(elements.trainingFilter.value.trim());
     const packageFilter = encodeURIComponent(elements.trainingPackageFilter.value);
-    const [candidateData, packages] = await Promise.all([apiRequest(`/training-pool?q=${query}&package=${packageFilter}&limit=200`), apiRequest("/training-packages")]);
+    const profile = encodeURIComponent(elements.trainingProfileSelect.value);
+    const [candidateData, packages] = await Promise.all([apiRequest(`/training-pool?profile=${profile}&q=${query}&package=${packageFilter}&limit=200`), apiRequest(`/training-packages?profile=${profile}`)]);
     state.candidates = candidateData.items; state.packages = packages; state.selectedCandidateIds.clear();
+    elements.selectAllCandidates.checked = false;
     elements.trainingTotal.textContent = String(candidateData.total); elements.trainingCount.textContent = `(${candidateData.total})`;
     renderPackageFilter(); renderCandidates(); renderPackages(); renderPackageSelect(); updateAddButton();
   } catch (error) { showMessage(elements.trainingMessage, error.message, true); }
@@ -503,13 +892,14 @@ function renderCandidates() {
     const image = document.createElement("img"); image.loading = "lazy"; image.src = `${API_BASE_PATH}/training-pool/${candidate.public_id}/image?thumbnail=true`; image.alt = candidate.original_filename; image.addEventListener("click", () => openLargeImage(`${API_BASE_PATH}/training-pool/${candidate.public_id}/image`));
     const body = document.createElement("div"); const name = document.createElement("h3"); name.textContent = candidate.original_filename; const reason = document.createElement("p"); reason.textContent = candidate.reason;
     const meta = document.createElement("p"); meta.className = "muted"; meta.textContent = translate("training.candidate_by", { name: candidate.candidate_by_name || candidate.candidate_by_email, date: formatDateTime(candidate.created) });
+    const profile = document.createElement("p"); profile.className = "muted"; profile.textContent = translate("training.profile_value", { name: candidate.profile.name, version: candidate.profile.version });
     const tags = document.createElement("div"); tags.className = "saved-tags"; (candidate.tags || []).forEach((tag) => { const badge = document.createElement("span"); badge.textContent = tag; tags.append(badge); });
     const counts = document.createElement("p"); counts.className = "muted"; counts.textContent = Object.entries(candidate.detections_summary?.counts || {}).map(([name, count]) => `${classLabel(name)}: ${count}`).join(" · ");
     const packages = document.createElement("div"); packages.className = "candidate-packages"; const packageLabel = document.createElement("strong"); packageLabel.textContent = translate("training.candidate_packages"); packages.append(packageLabel);
     if (!(candidate.packages || []).length) { const empty = document.createElement("span"); empty.textContent = translate("training.package_filter_none"); packages.append(empty); }
     else { const list = document.createElement("ul"); candidate.packages.forEach((item) => { const row = document.createElement("li"); row.textContent = `${item.package_name} · ${item.added_by_name || item.added_by_email} · ${formatDateTime(item.added_at)}`; list.append(row); }); packages.append(list); }
     const remove = document.createElement("button"); remove.type = "button"; remove.className = "danger-button compact"; remove.textContent = translate("training.delete"); remove.addEventListener("click", () => deleteCandidate(candidate.public_id));
-    body.append(name); if (candidate.reason) body.append(reason); if (tags.childElementCount) body.append(tags); body.append(counts, meta, packages, remove); card.append(checkbox, image, body); elements.candidateGrid.append(card);
+    body.append(name, profile); if (candidate.reason) body.append(reason); if (tags.childElementCount) body.append(tags); body.append(counts, meta, packages, remove); card.append(checkbox, image, body); elements.candidateGrid.append(card);
   });
 }
 
@@ -530,7 +920,8 @@ function renderPackages() {
     const heading = document.createElement("h3"); heading.textContent = item.package_name;
     const details = document.createElement("p"); details.textContent = `${translate("training.package_count", { count: item.image_count })} · ${translate(item.first_downloaded_at ? "training.package_locked" : "training.package_open")}`;
     const creator = document.createElement("p"); creator.className = "muted"; creator.textContent = translate("training.created_by", { name: item.created_by_name || item.created_by_email });
-    card.append(heading, details, creator);
+    const profile = document.createElement("p"); profile.className = "muted"; profile.textContent = translate("training.profile_value", { name: item.profile.name, version: item.profile.version });
+    card.append(heading, profile, details, creator);
     if (item.last_downloaded_at) { const last = document.createElement("p"); last.className = "muted"; last.textContent = translate("training.last_download", { name: item.last_downloaded_by_name, date: formatDateTime(item.last_downloaded_at) }); card.append(last); }
     const actions = document.createElement("div"); actions.className = "card-actions";
     const view = document.createElement("button"); view.type = "button"; view.className = "secondary-button"; view.textContent = translate("training.view_contents"); view.addEventListener("click", () => showPackageContents(item.public_id));
@@ -584,7 +975,7 @@ function updateAddButton() { elements.addToPackageButton.disabled = !elements.pa
 
 async function createPackage(event) {
   event.preventDefault(); clearMessage(elements.trainingMessage);
-  try { await apiRequest("/training-packages", { method: "POST", body: JSON.stringify({ name: elements.packageName.value.trim() }) }); elements.packageCreateForm.reset(); showMessage(elements.trainingMessage, translate("training.package_created")); await loadTrainingData(); }
+  try { await apiRequest("/training-packages", { method: "POST", body: JSON.stringify({ name: elements.packageName.value.trim(), profile: elements.trainingProfileSelect.value }) }); elements.packageCreateForm.reset(); showMessage(elements.trainingMessage, translate("training.package_created")); await loadTrainingData(); }
   catch (error) { showMessage(elements.trainingMessage, error.message, true); }
 }
 
@@ -607,7 +998,7 @@ async function deleteCandidate(id) {
 function openJsonDialog() { const values = displayResults(); elements.jsonOutput.textContent = JSON.stringify(values.length === 1 ? values[0] : values, null, 2); elements.jsonDialog.showModal(); }
 function displayResults() { return state.results.map((result) => { const copy = structuredClone(result); if (copy.annotated_image) delete copy.annotated_image.base64; return copy; }); }
 function downloadJson() { const value = state.results.length === 1 ? displayResults()[0] : displayResults(); const url = URL.createObjectURL(new Blob([`${JSON.stringify(value, null, 2)}\n`], { type: "application/json" })); const link = document.createElement("a"); link.href = url; link.download = `${safeFilename(state.selectedFile?.name || "tuvastus")}-tuvastus.json`; link.click(); URL.revokeObjectURL(url); }
-function openLargeImage(src, result = null) { elements.largeImage.src = src; configureDetectionAreaOverlay(elements.largeDetectionAreaOverlay, result); elements.imageDialog.showModal(); }
+function openLargeImage(src, result = null) { elements.largeImage.src = src; configureDetectionAreaOverlay(elements.largeDetectionAreaOverlay, resultProfile(result), elements.detectionAreaInput.checked); elements.imageDialog.showModal(); }
 function imageDataUrl(result) { return `data:${result.annotated_image.media_type};base64,${result.annotated_image.base64}`; }
 
 function profileHasDetectionArea(profile) { return Array.isArray(profile?.roi_polygon) && profile.roi_polygon.length >= 3; }
@@ -616,31 +1007,31 @@ function detectionAreaPath(points) {
   const polygon = points.map(([x, y], index) => `${index === 0 ? "M" : "L"} ${x * 1000} ${y * 1000}`).join(" ");
   return { outside: `M 0 0 H 1000 V 1000 H 0 Z ${polygon} Z` };
 }
-function configureDetectionAreaOverlay(overlay, result) {
-  const profile = resultProfile(result);
+function configureDetectionAreaOverlay(overlay, profile, visible) {
   if (!profileHasDetectionArea(profile)) { overlay.classList.add("hidden"); return; }
   const path = detectionAreaPath(profile.roi_polygon);
   overlay.querySelector(".detection-area-shade").setAttribute("d", path.outside);
   overlay.querySelector(".detection-area-boundary").setAttribute("points", profile.roi_polygon.map(([x, y]) => `${x * 1000},${y * 1000}`).join(" "));
-  overlay.classList.toggle("hidden", !elements.detectionAreaInput.checked);
+  overlay.classList.toggle("hidden", !visible);
 }
 function createDetectionAreaOverlay(result) {
-  if (!profileHasDetectionArea(resultProfile(result))) return null;
+  const profile = resultProfile(result);
+  if (!profileHasDetectionArea(profile)) return null;
   const namespace = "http://www.w3.org/2000/svg";
   const overlay = document.createElementNS(namespace, "svg");
   overlay.setAttribute("viewBox", "0 0 1000 1000"); overlay.setAttribute("preserveAspectRatio", "none"); overlay.setAttribute("aria-hidden", "true"); overlay.classList.add("detection-area-overlay");
   const shade = document.createElementNS(namespace, "path"); shade.classList.add("detection-area-shade"); shade.setAttribute("fill-rule", "evenodd");
   const boundary = document.createElementNS(namespace, "polygon"); boundary.classList.add("detection-area-boundary");
-  overlay.append(shade, boundary); configureDetectionAreaOverlay(overlay, result); return overlay;
+  overlay.append(shade, boundary); configureDetectionAreaOverlay(overlay, profile, elements.detectionAreaInput.checked); return overlay;
 }
-function updateDetectionAreaOverlays() { document.querySelectorAll(".detection-area-overlay").forEach((overlay) => overlay.classList.toggle("hidden", !elements.detectionAreaInput.checked)); }
+function updateDetectionAreaOverlays() { document.querySelectorAll("#analysisView .detection-area-overlay, #imageDialog .detection-area-overlay").forEach((overlay) => overlay.classList.toggle("hidden", !elements.detectionAreaInput.checked)); }
 
 function createCountCard(label, count, total = false) { const card = document.createElement("div"); card.className = `count-card${total ? " is-total" : ""}`; card.innerHTML = `<span class="count-label">${escapeHtml(label)}</span><strong class="count-value">${count}</strong>`; return card; }
 function renderDetections(detections) { elements.detectionsSummary.textContent = translate("detections.summary", { count: detections.length }); elements.detectionsBody.replaceChildren(); detections.forEach((detection) => { const row = document.createElement("tr"); [classLabel(detection.class), formatNumber(detection.confidence, 3), detection.bbox_xyxy.join(", ")].forEach((value) => { const cell = document.createElement("td"); cell.textContent = value; row.append(cell); }); elements.detectionsBody.append(row); }); }
-function classLabel(name) {
+function classLabel(name, profile = selectedProfile()) {
   const translated = state.translations[`classes.${name}`];
   if (translated) return translated;
-  const profileClass = selectedProfile()?.classes?.find((item) => item.code === name);
+  const profileClass = profile?.classes?.find((item) => item.code === name);
   return profileClass?.name || name;
 }
 function formatNumber(value, digits) { return new Intl.NumberFormat("et-EE", { maximumFractionDigits: digits }).format(value); }

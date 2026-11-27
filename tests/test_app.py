@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import base64
+import hashlib
 import os
 import struct
+from dataclasses import replace
 from decimal import Decimal
 from datetime import datetime
 from io import BytesIO
@@ -10,6 +13,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import cv2
+import httpx
 import numpy as np
 import pytest
 from fastapi import HTTPException
@@ -37,6 +41,7 @@ class FakeRepository:
                 "sort_order": 10,
                 "is_default": 1,
                 "source_image_url": None,
+                "capture_interval_seconds": None,
                 "model_files_json": ["best.onnx"],
                 "vehicle_classes_json": [
                     {"model_index": 0, "code": "bus", "name": "Buss"},
@@ -57,6 +62,14 @@ TEST_USER = traffic_app.User(
     role_code="USER",
     enabled=True,
 )
+LIVE_VIEWER_ID = "test-viewer-00000001"
+
+
+def _live_path(extra_query: str = "") -> str:
+    query = f"viewer_id={LIVE_VIEWER_ID}&poll_interval_seconds=5"
+    if extra_query:
+        query = f"{query}&{extra_query}"
+    return f"/api/camera-profiles/parnu-mnt-karja/live-frame?{query}"
 
 
 @pytest.fixture(scope="module")
@@ -114,6 +127,367 @@ def _settings() -> traffic_app.Settings:
         google_client_id="test.apps.googleusercontent.com",
         session_secret="test-session-secret",
     )
+
+
+def _enable_live_profile(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> traffic_app.CameraProfile:
+    base_profile = traffic_app._camera_profiles(
+        FakeRepository().list_camera_profiles()
+    )[0]
+    profile = replace(
+        base_profile,
+        source_image_url="https://camera.example.test/current.jpg",
+        capture_interval_seconds=5,
+    )
+    monkeypatch.setattr(
+        traffic_app,
+        "_camera_profile",
+        lambda request, profile_code: profile,
+    )
+    client.app.state.live_cache = traffic_app.LiveFrameCache(client.app.state.settings)
+    return profile
+
+
+def _live_detection_payload(profile: traffic_app.CameraProfile) -> dict[str, object]:
+    return {
+        "request_received_at": "2026-11-27T12:00:00+00:00",
+        "processing_duration_ms": 12.5,
+        "filename": "current.jpg",
+        "conf": 0.45,
+        "profile": {
+            "code": profile.code,
+            "version": profile.version,
+            "name": profile.name,
+        },
+        "model": profile.default_model,
+        "model_sha256": "a" * 64,
+        "cross_class_dedup": 1,
+        "cross_class_iou_threshold": 0.8,
+        "image_size": {"width": 2, "height": 2},
+        "counts": {name: 0 for name in profile.class_codes},
+        "total": 0,
+        "detections": [],
+        "annotated_image": {
+            "media_type": "image/jpeg",
+            "base64": base64.b64encode(b"annotated-jpeg").decode("ascii"),
+        },
+    }
+
+
+def test_live_frame_returns_204_without_detection_when_image_is_unchanged(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_live_profile(client, monkeypatch)
+    image = _encode(np.zeros((2, 2, 3), dtype=np.uint8), ".jpg")
+    image_hash = hashlib.sha256(image).hexdigest()
+    detection_calls = 0
+
+    async def load_camera_image(*args: object) -> tuple[bytes, str, str, int, int]:
+        del args
+        return image, "image/jpeg", "current.jpg", 2, 2
+
+    async def detect_live_image(*args: object) -> dict[str, object]:
+        nonlocal detection_calls
+        del args
+        detection_calls += 1
+        return {}
+
+    monkeypatch.setattr(traffic_app, "_load_camera_image", load_camera_image)
+    monkeypatch.setattr(traffic_app, "_detect_live_image", detect_live_image)
+
+    response = client.get(_live_path(f"previous_hash={image_hash}"))
+
+    assert response.status_code == 204
+    assert detection_calls == 0
+
+
+def test_live_frame_sends_changed_image_to_detection_with_selected_options(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile = _enable_live_profile(client, monkeypatch)
+    image = _encode(np.full((2, 2, 3), 20, dtype=np.uint8), ".jpg")
+    calls: list[dict[str, object]] = []
+
+    async def load_camera_image(*args: object) -> tuple[bytes, str, str, int, int]:
+        del args
+        return image, "image/jpeg", "current.jpg", 2, 2
+
+    async def detect_live_image(
+        request: object,
+        data: bytes,
+        media_type: str,
+        filename: str,
+        params: dict[str, str],
+    ) -> dict[str, object]:
+        calls.append({
+            "request": request,
+            "data": data,
+            "media_type": media_type,
+            "filename": filename,
+            "params": params,
+        })
+        return _live_detection_payload(profile)
+
+    monkeypatch.setattr(traffic_app, "_load_camera_image", load_camera_image)
+    monkeypatch.setattr(traffic_app, "_detect_live_image", detect_live_image)
+
+    response = client.get(_live_path(
+        "model=best.onnx&conf=0.33&cross_class_dedup=1"
+        "&cross_class_iou_threshold=0.7"
+    ))
+
+    assert response.status_code == 200
+    assert len(calls) == 1
+    assert calls[0]["data"] == image
+    assert calls[0]["media_type"] == "image/jpeg"
+    assert calls[0]["filename"] == "current.jpg"
+    assert calls[0]["params"] == {
+        "profile": "parnu-mnt-karja",
+        "model": "best.onnx",
+        "conf": "0.33",
+        "cross_class_dedup": "1",
+        "cross_class_iou_threshold": "0.7",
+    }
+
+
+def test_live_frame_returns_hash_counts_and_annotated_image(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile = _enable_live_profile(client, monkeypatch)
+    image = _encode(np.full((2, 2, 3), 40, dtype=np.uint8), ".jpg")
+    detection_payload = _live_detection_payload(profile)
+    detection_payload["counts"] = {"bus": 1, "car": 2, "tram": 0}
+    detection_payload["total"] = 3
+
+    async def load_camera_image(*args: object) -> tuple[bytes, str, str, int, int]:
+        del args
+        return image, "image/jpeg", "current.jpg", 2, 2
+
+    async def detect_live_image(*args: object) -> dict[str, object]:
+        del args
+        return detection_payload
+
+    monkeypatch.setattr(traffic_app, "_load_camera_image", load_camera_image)
+    monkeypatch.setattr(traffic_app, "_detect_live_image", detect_live_image)
+
+    response = client.get(_live_path())
+    payload = response.json()
+
+    assert response.status_code == 200
+    assert payload["image_sha256"] == hashlib.sha256(image).hexdigest()
+    assert payload["counts"] == {"bus": 1, "car": 2, "tram": 0}
+    assert payload["total"] == 3
+    assert payload["annotated_image"] == detection_payload["annotated_image"]
+
+
+def test_live_detection_cache_coalesces_identical_concurrent_requests() -> None:
+    profile = replace(
+        traffic_app._camera_profiles(FakeRepository().list_camera_profiles())[0],
+        source_image_url="https://camera.example.test/current.jpg",
+        capture_interval_seconds=5,
+    )
+    image = _encode(np.full((2, 2, 3), 60, dtype=np.uint8), ".jpg")
+
+    async def scenario() -> None:
+        cache = traffic_app.LiveFrameCache(_settings())
+
+        async def load() -> tuple[bytes, str, str, int, int]:
+            return image, "image/jpeg", "current.jpg", 2, 2
+
+        frame = await cache.camera_frame(profile, load)
+        detection_calls = 0
+
+        async def detect() -> dict[str, object]:
+            nonlocal detection_calls
+            detection_calls += 1
+            await asyncio.sleep(0.01)
+            return {"result": "shared"}
+
+        results = await asyncio.gather(
+            cache.detection_result(profile, frame, ("best.onnx", 0.45, 1, 0.8), detect),
+            cache.detection_result(profile, frame, ("best.onnx", 0.45, 1, 0.8), detect),
+        )
+
+        assert detection_calls == 1
+        assert results == [{"result": "shared"}, {"result": "shared"}]
+
+    asyncio.run(scenario())
+
+
+def test_paused_viewer_keeps_its_clean_frame_while_another_viewer_advances() -> None:
+    profile = replace(
+        traffic_app._camera_profiles(FakeRepository().list_camera_profiles())[0],
+        source_image_url="https://camera.example.test/current.jpg",
+        capture_interval_seconds=5,
+    )
+    images = [
+        _encode(np.full((2, 2, 3), value, dtype=np.uint8), ".jpg")
+        for value in (80, 100, 120)
+    ]
+
+    async def scenario() -> None:
+        cache = traffic_app.LiveFrameCache(_settings())
+
+        async def frame_for(data: bytes) -> traffic_app.LiveRawFrame:
+            async def load() -> tuple[bytes, str, str, int, int]:
+                return data, "image/jpeg", "current.jpg", 2, 2
+
+            return await cache.camera_frame(profile, load)
+
+        first = await frame_for(images[0])
+        await cache.record_viewer_frame(1, profile, "viewer-a-00000001", first, 5)
+        await cache.record_viewer_frame(1, profile, "viewer-b-00000001", first, 1)
+        await cache.pause_viewer(
+            1, profile, "viewer-a-00000001", first.image_sha256
+        )
+
+        second = await frame_for(images[1])
+        await cache.record_viewer_frame(1, profile, "viewer-b-00000001", second, 1)
+        third = await frame_for(images[2])
+        await cache.record_viewer_frame(1, profile, "viewer-b-00000001", third, 1)
+
+        retained = await cache.training_frame(
+            1, profile, "viewer-a-00000001", first.image_sha256
+        )
+        assert retained.data == images[0]
+
+    asyncio.run(scenario())
+
+
+def test_late_live_request_cannot_overwrite_a_paused_viewer_frame() -> None:
+    profile = replace(
+        traffic_app._camera_profiles(FakeRepository().list_camera_profiles())[0],
+        source_image_url="https://camera.example.test/current.jpg",
+        capture_interval_seconds=5,
+    )
+    first_image = _encode(np.full((2, 2, 3), 80, dtype=np.uint8), ".jpg")
+    late_image = _encode(np.full((2, 2, 3), 120, dtype=np.uint8), ".jpg")
+
+    async def scenario() -> None:
+        cache = traffic_app.LiveFrameCache(_settings())
+
+        async def frame_for(data: bytes) -> traffic_app.LiveRawFrame:
+            async def load() -> tuple[bytes, str, str, int, int]:
+                return data, "image/jpeg", "current.jpg", 2, 2
+
+            return await cache.camera_frame(profile, load)
+
+        first = await frame_for(first_image)
+        await cache.record_viewer_frame(1, profile, LIVE_VIEWER_ID, first, 5)
+        await cache.pause_viewer(1, profile, LIVE_VIEWER_ID, first.image_sha256)
+
+        late = await frame_for(late_image)
+        await cache.record_viewer_frame(1, profile, LIVE_VIEWER_ID, late, 5)
+
+        retained = await cache.training_frame(
+            1, profile, LIVE_VIEWER_ID, first.image_sha256
+        )
+        assert retained.data == first_image
+
+    asyncio.run(scenario())
+
+
+def test_paused_live_frame_is_saved_to_training_from_clean_cached_image(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile = _enable_live_profile(client, monkeypatch)
+    image = _encode(np.full((2, 2, 3), 140, dtype=np.uint8), ".jpg")
+    image_hash = hashlib.sha256(image).hexdigest()
+    saved: dict[str, object] = {}
+
+    async def load_camera_image(*args: object) -> tuple[bytes, str, str, int, int]:
+        del args
+        return image, "image/jpeg", "current.jpg", 2, 2
+
+    async def detect_live_image(*args: object) -> dict[str, object]:
+        del args
+        return _live_detection_payload(profile)
+
+    def save_candidate(*args: object, **kwargs: object) -> dict[str, object]:
+        del args
+        saved.update(kwargs)
+        return {"id": "candidate-id"}
+
+    monkeypatch.setattr(traffic_app, "_load_camera_image", load_camera_image)
+    monkeypatch.setattr(traffic_app, "_detect_live_image", detect_live_image)
+    monkeypatch.setattr(traffic_app, "_verify_csrf", lambda request: None)
+    monkeypatch.setattr(
+        traffic_app, "_create_training_candidate_from_data", save_candidate
+    )
+
+    live_response = client.get(_live_path())
+    assert live_response.status_code == 200
+
+    pause_response = client.post(
+        f"/api/camera-profiles/{profile.code}/live-viewers/{LIVE_VIEWER_ID}/pause",
+        json={"image_sha256": image_hash},
+    )
+    assert pause_response.status_code == 200
+
+    training_response = client.post(
+        "/api/training-pool/live-frame",
+        json={
+            "viewer_id": LIVE_VIEWER_ID,
+            "profile": profile.code,
+            "image_sha256": image_hash,
+            "reason": "Huvitav live-kaader",
+            "tags": ["Hämar/öö"],
+            "model": profile.default_model,
+            "cross_class_dedup": 1,
+            "cross_class_iou_threshold": 0.8,
+        },
+    )
+
+    assert training_response.status_code == 201
+    assert saved["source_data"] == image
+    assert saved["source_media_type"] == "image/jpeg"
+    assert saved["profile"] == profile
+
+
+def test_live_frame_rejects_profile_without_source_url(client: TestClient) -> None:
+    response = client.get(_live_path())
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == "Camera profile does not have a source image URL"
+
+
+def test_live_frame_returns_502_when_camera_is_unavailable(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_live_profile(client, monkeypatch)
+
+    async def unavailable(
+        self: httpx.AsyncClient,
+        url: object,
+        *args: object,
+        **kwargs: object,
+    ) -> httpx.Response:
+        del self, args, kwargs
+        request = httpx.Request("GET", str(url))
+        raise httpx.ConnectError("Camera unavailable", request=request)
+
+    monkeypatch.setattr(httpx.AsyncClient, "get", unavailable)
+
+    response = client.get(_live_path())
+
+    assert response.status_code == 502
+    assert response.json()["detail"] == "Camera image is unavailable"
+
+
+def test_camera_profile_accepts_null_and_zero_capture_interval() -> None:
+    rows = FakeRepository().list_camera_profiles()
+    assert traffic_app._camera_profiles(rows)[0].capture_interval_seconds is None
+
+    rows[0]["source_image_url"] = "https://camera.example.test/current.jpg"
+    rows[0]["capture_interval_seconds"] = 0
+    assert traffic_app._camera_profiles(rows)[0].capture_interval_seconds == 0
 
 
 def test_camera_profiles_require_exactly_one_default() -> None:

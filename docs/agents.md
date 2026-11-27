@@ -135,6 +135,8 @@ Registrit tuleb täiendada kohe, kui projektile lisandub README, andmeskeem, API
 - [`db/schema/001_core_schema.sql`](../db/schema/001_core_schema.sql) — Oracle'i skeemi loomise skript.
 - [`db/schema/002_camera_profiles.sql`](../db/schema/002_camera_profiles.sql) — olemasoleva skeemi kaameraprofiilide migratsioon; käivitamine nõuab kasutaja eraldi luba.
 - [`kaameraprofiilide-täiendusettepanek.md`](kaameraprofiilide-täiendusettepanek.md) — kaameraprofiilide, ROI-maskimise ja profiilipõhiste treeningandmete kinnitatud teostuskavand.
+- [`kaamerate-live-view-teostusplaan.md`](kaamerate-live-view-teostusplaan.md) — brauseripõhise kaameraseire, snapshot-vahenduse, pildimuutuse kontrolli ja Canvas-kuvamise kinnitatud teostuslahendus.
+- [`live-view-cache-ja-treeningukaadri-lahendus.md`](live-view-cache-ja-treeningukaadri-lahendus.md) — mitme live-vaataja jagatud tuvastuscache'i, single-flight'i, vaatajapõhiste puhaste kaadrite puhvrite ja live-kaadri treeningusse saatmise kinnitatud lahendus.
 - [`tests/test_app.py`](../tests/test_app.py) — automatiseeritud API ja eeltöötluse testid.
 - [`tests/test_ui_contract.py`](../tests/test_ui_contract.py) — UI staatilise lepingu testid.
 - [`requirements-test.txt`](../requirements-test.txt) — testide fikseeritud sõltuvused.

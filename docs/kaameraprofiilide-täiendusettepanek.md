@@ -350,8 +350,10 @@ UI jaoks tagastatakse vähemalt:
 - klassikoodid ja kuvatavad nimed;
 - profiili vaikimisi tuvastuslävend.
 
-ROI-mask ja `source_image_url` ei ole praegusele analüüsi-UI-le vajalikud ning
-neid ei pea selles vastuses väljastama.
+Ühe pildi analüüsi-UI ei kasuta `source_image_url` väärtust. Hiljem lisatud
+„Kaamerate live view“ filtreerib selle järgi kasutatavad profiilid, mistõttu
+profiili API väljastab nii `source_image_url`, `capture_interval_seconds` kui
+ka normaliseeritud `roi_polygon` punktid.
 
 ### 10.2. Tuvastuspäring
 

@@ -4,8 +4,11 @@
 
 Dokumendi koostas OpenAI Codex 23. novembril 2026 kasutaja nõudel ja täiendas
 26. novembril 2026 klassideülese duplikaadifiltri ning 27. novembril 2026
-kaameraprofiilide aluskihi kontrollidega. Testiplaan on teadlikult minimaalne
-ja vajab enne käivitamist kasutaja heakskiitu.
+kaameraprofiilide aluskihi kontrollidega ning sama kuupäeva hiljem kaamerate
+live-vaate kavandatud kontrollidega. 27. novembril lisati ka jagatud live-cache'i,
+vaatajapõhise puhvri ja live-kaadri treeningusse saatmise kontrollid.
+Testiplaan on teadlikult minimaalne ja vajab enne käivitamist kasutaja
+heakskiitu.
 
 ## 2. Sisukord
 
@@ -95,6 +98,27 @@ nginx-liidestuse ja avalike HTTP-vastuste kontrollid.
     lõuendil koos maski ning alumise halli täitega õige tensori. Kontrollida ka
     olemasoleva vaikeprofiili API regressiooni.
 
+11. **Kaamerate live view.** Kontrollida URL-iga profiilide filtreerimist,
+    nullable intervalli, 0 või puuduva intervalli korral keelatud käivitamist,
+    muutunud pildi räsi ja sama `previous_hash` korral `204` vastust.
+    Muutunud pildi korral kontrollida olemasoleva `POST /api/detect/image`
+    lepingu kasutamist, automaatset annotatsioonipildi vahetust,
+    sessiooniloendureid, kattuvate tsüklite vältimist, seadete rakendumist alles
+    järgmisele muutunud kaadrile ning ühise ROI SVG-loogika kohest näitamist ja
+    peitmist.
+
+12. **Jagatud live-cache ja treeningukaader.** Kontrollida, et kaks sama
+    profiili, pildiräsi ja seadekomplekti samaaegset päringut põhjustavad ainult
+    ühe tuvastusväljakutse. Kontrollida, et ühe vaataja pausile pandud puhas
+    kaader jääb alles ka siis, kui teine vaataja saab vähemalt kaks uuemat
+    kaadrit. Kontrollida pausi- ja heartbeat-lease'i valideerimist ning seda, et
+    live-kaadri treeninguotsing annab salvestusloogikale puhta originaalpildi,
+    mitte kastidega Base64-pildi. UI lepingus kontrollida `viewer_id`,
+    pollimisintervalli, ainult pausil nähtavat „Saada treeningusse“ nuppu ja
+    pildita treeningupäringut. Eraldi regressioonitest kontrollib, et enne pausi
+    alanud ja pärast pausi lõpetanud live-päring ei kirjuta pausile fikseeritud
+    kaadrit üle.
+
 Automatiseeritud testid katavad punktid 1 ja 2, punktide 3 ja 4 API lepingu
 sünteetilise pildiga ning punkti 5 järeltöötluse ja API lepingu. Staatilised
 UI-testid katavad punkti 6 struktuuri ja päringuparameetrid. Punktid 7–9
@@ -117,6 +141,50 @@ Pärast loa saamist märgitakse iga kontrolli juurde kuupäev, kasutatud sisend,
 tulemus ja võimalik kõrvalekalle. Pärispilte Git-i ega andmebaasi ei lisata.
 
 ## 8. Käivitatud kontrollid
+
+### 27. november 2026 — pausile fikseeritud live-kaadri regressioonitest
+
+- Reprodutseeritud võistlustingimus: enne pausi alanud live-päring võis pärast
+  pausi lõppemisel vaataja lease'i uuesti aktiivseks kirjutada. See põhjustas
+  treeningusse saatmisel ja heartbeat'il HTTP 409 vastuse „Live frame is no
+  longer available“.
+- Pärast parandust kontrolliti hilinenud live-päringu mõju, puhta cache'itud
+  kaadri treeninguloogikale edastamist ja UI viewer-ID lepingut.
+- Tulemus: `3 passed` (0,81 s). Pytest väljastas ühe olemasoleva Starlette
+  `TestClient` / `httpx` deprekatsioonihoiatuse.
+
+### 27. november 2026 — jagatud live-cache ja treeningukaadri testid
+
+- Kasutaja loal käivitati ainult uue live-cache'i ja live-kaadri
+  treeningusse saatmise viis sihttesti.
+- Kontrollid katsid sama kaadri samaaegsete tuvastuspäringute koondamise üheks
+  inferentsiks, pausile pandud vaataja puhta kaadri säilimise teise vaataja
+  edasiliikumisel, puhta cache'itud originaalpildi edastamise
+  treeninguloogikale ning live-vaate UI lepingu.
+- Tulemus: `5 passed` (0,95 s).
+- Pytest väljastas ühe olemasoleva Starlette `TestClient` / `httpx`
+  deprekatsioonihoiatuse; see ei põhjustanud testi ebaõnnestumist.
+- Esimene käivitus leidis testing-image'ist vanema testifaili ega käivitanud
+  sihtteste. Pärast testing-image'i uuesti ehitamist käivitati sama testivalik
+  edukalt `PYTHONPATH=/app` keskkonnaga.
+
+### 27. november 2026 — kaamerate live-vaate testid 2–7
+
+- Kasutaja loal käivitati ainult live-vaate kontrollid 2–7; profiili API
+  üldkontrolli ja andmebaasipiirangu testi ei käivitatud.
+- Kontrollid hõlmasid muutumata pildi `204` vastust ilma tuvastuskutsuta,
+  muutunud pildi ühekordset tuvastuskutset koos valitud seadetega, räsi,
+  loendurite ja annotatsioonipildi vastust, puuduva URL-i `422` vastust,
+  kaamera ühendusvea `502` vastust ning `NULL` ja 0 intervalli koos UI
+  positiivse täisarvu nõudega.
+- Esimesel käivitusel läbis 4 testi ja 3 peatusid testiabifunktsiooni jagatud
+  `app.state` muutmise tõttu enne tootmiskoodi kontrollimist. Abifunktsioon
+  muudeti mock'ima ainult profiiliotsingut.
+- Korduskäivitusel läbisid kõik 7 valitud testi 0,82 sekundiga.
+- Testid ei ühendanud Oracle'iga ega päris kaamera URL-iga ning migratsiooni ei
+  käivitatud.
+- Väljundis oli kaks mittekriitilist Starlette/FastAPI
+  deprekatsioonihoiatust.
 
 ### 27. november 2026 — profiilivalik ja kahe profiili pärispildid
 

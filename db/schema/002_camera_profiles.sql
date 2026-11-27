@@ -12,6 +12,7 @@ CREATE TABLE camera_profiles (
     sort_order NUMBER(10) DEFAULT 0 NOT NULL,
     is_default NUMBER(1) DEFAULT 0 NOT NULL,
     source_image_url VARCHAR2(2000 CHAR),
+    capture_interval_seconds NUMBER(10),
     model_files_json JSON NOT NULL,
     vehicle_classes_json JSON NOT NULL,
     roi_mask_json JSON,
@@ -25,6 +26,10 @@ CREATE TABLE camera_profiles (
         UNIQUE (profile_code, profile_version),
     CONSTRAINT camera_profiles_version_ck CHECK (profile_version > 0),
     CONSTRAINT camera_profiles_default_ck CHECK (is_default IN (0, 1)),
+    CONSTRAINT camera_profiles_capture_interval_ck CHECK (
+        capture_interval_seconds IS NULL
+        OR (source_image_url IS NOT NULL AND capture_interval_seconds >= 0)
+    ),
     CONSTRAINT camera_profiles_confidence_ck
         CHECK (default_confidence BETWEEN 0.01 AND 1.0)
 );
